@@ -1,0 +1,1952 @@
+const mongoose = require('mongoose');
+const DamageClaim = require('../models/DamageClaim');
+const Order = require('../models/Order');
+const StaffActivity = require('../models/StaffActivity');
+const RetailerShopActivity = require('../models/RetailerShopActivity');
+const MarketingStaffActivity = require('../models/MarketingStaffActivity');
+const User = require('../models/User');
+const Distributor = require('../models/Distributor');
+const Product = require('../models/Product');
+const Shop = require('../models/Shop');
+const logger = require('../utils/logger');
+const StaffDistributorAssignment = require('../models/StaffDistributorAssignment');
+
+/**
+ * Get analytics for damage claims
+ */
+exports.getDamageClaimsAnalytics = async (req, res) => {
+  try {
+    const { timeRange } = req.query;
+    const dateFilter = getDateFilterFromTimeRange(timeRange);
+
+    // Total claims count
+    const totalClaims = await DamageClaim.countDocuments(dateFilter);
+    
+    // Claims by status
+    const approvedClaims = await DamageClaim.countDocuments({ 
+      ...dateFilter, 
+      status: { $in: ['Approved', 'Partially Approved'] } 
+    });
+    const pendingClaims = await DamageClaim.countDocuments({ ...dateFilter, status: 'Pending' });
+    const rejectedClaims = await DamageClaim.countDocuments({ ...dateFilter, status: 'Rejected' });
+    
+    // Approval rate
+    const approvalRate = totalClaims > 0 
+      ? Math.round((approvedClaims / totalClaims) * 100) 
+      : 0;
+    
+    // Average processing time (days)
+    const processedClaims = await DamageClaim.find({
+      ...dateFilter,
+      status: { $in: ['Approved', 'Partially Approved', 'Rejected'] },
+      approvedDate: { $exists: true }
+    });
+    
+    let avgProcessingTime = 0;
+    if (processedClaims.length > 0) {
+      const totalProcessingTime = processedClaims.reduce((sum, claim) => {
+        const createdDate = new Date(claim.createdAt);
+        const processedDate = new Date(claim.approvedDate || claim.updatedAt);
+        const processingTime = (processedDate - createdDate) / (1000 * 60 * 60 * 24); // days
+        return sum + processingTime;
+      }, 0);
+      avgProcessingTime = parseFloat((totalProcessingTime / processedClaims.length).toFixed(1));
+    }
+    
+    // Claims by distributor
+    const claimsByDistributor = await DamageClaim.aggregate([
+      { $match: dateFilter },
+      { $group: { _id: '$distributorId', name: { $first: '$distributorName' }, claims: { $sum: 1 } } },
+      { $project: { _id: 0, name: 1, claims: 1 } },
+      { $sort: { claims: -1 } },
+      { $limit: 6 }
+    ]);
+    
+    // Claims by product
+    const claimsByProduct = await DamageClaim.aggregate([
+      { $match: dateFilter },
+      { 
+        $group: { 
+          _id: { brand: '$brand', variant: '$variant', size: '$size' },
+          claims: { $sum: 1 } 
+        } 
+      },
+      { 
+        $project: { 
+          _id: 0, 
+          name: { 
+            $concat: [ 
+              '$_id.brand', ' ', 
+              '$_id.variant', ' ', 
+              '$_id.size' 
+            ] 
+          },
+          claims: 1 
+        } 
+      },
+      { $sort: { claims: -1 } },
+      { $limit: 6 }
+    ]);
+    
+    // Claims by damage type
+    const claimsByDamageType = await DamageClaim.aggregate([
+      { $match: dateFilter },
+      { $group: { _id: '$damageType', value: { $sum: 1 } } },
+      { $project: { _id: 0, name: '$_id', value: 1 } },
+      { $sort: { value: -1 } }
+    ]);
+    
+    // Monthly approval rate trend
+    const approvalRateByMonth = await getMonthlyTrendData(
+      DamageClaim,
+      { ...dateFilter, status: { $in: ['Approved', 'Partially Approved', 'Rejected'] } },
+      (results) => {
+        return results.map(month => {
+          const approvalRate = month.total > 0 
+            ? Math.round((month.approved / month.total) * 100) 
+            : 0;
+          return {
+            month: month.month,
+            approvalRate
+          };
+        });
+      }
+    );
+    
+    // Monthly claims trend
+    const claimsTrend = await getMonthlyTrendData(
+      DamageClaim,
+      dateFilter,
+      (results) => {
+        return results.map(month => ({
+          month: month.month,
+          submitted: month.total,
+          approved: month.approved,
+          rejected: month.rejected
+        }));
+      }
+    );
+
+    res.status(200).json({
+      totalClaims,
+      approvedClaims,
+      rejectedClaims,
+      pendingClaims,
+      approvalRate,
+      avgProcessingTime,
+      claimsByDistributor,
+      claimsByProduct,
+      claimsByDamageType,
+      approvalRateByMonth,
+      claimsTrend
+    });
+  } catch (error) {
+    console.error('Error getting damage claims analytics:', error);
+    res.status(500).json({ message: 'Error getting damage claims analytics' });
+  }
+};
+
+/**
+ * Get analytics for orders
+ */
+exports.getOrderAnalytics = async (req, res) => {
+  try {
+    const { timeRange } = req.query;
+    const dateFilter = getDateFilterFromTimeRange(timeRange);
+
+    // Total orders count
+    const totalOrders = await Order.countDocuments(dateFilter);
+    
+    // Orders by status
+    const approvedOrders = await Order.countDocuments({ ...dateFilter, status: 'Approved' });
+    const pendingOrders = await Order.countDocuments({ ...dateFilter, status: 'Requested' });
+    const rejectedOrders = await Order.countDocuments({ ...dateFilter, status: 'Rejected' });
+    const dispatchedOrders = await Order.countDocuments({ ...dateFilter, status: 'Dispatched' });
+    
+    // Fulfillment rate
+    const fulfillmentRate = totalOrders > 0 
+      ? Math.round(((approvedOrders + dispatchedOrders) / totalOrders) * 100) 
+      : 0;
+    
+    // Average processing time (days)
+    const processedOrders = await Order.find({
+      ...dateFilter,
+      status: { $in: ['Approved', 'Rejected', 'Dispatched'] }
+    });
+    
+    let avgProcessingTime = 0;
+    if (processedOrders.length > 0) {
+      const totalProcessingTime = processedOrders.reduce((sum, order) => {
+        const createdDate = new Date(order.createdAt);
+        const processedDate = new Date(order.updatedAt);
+        const processingTime = (processedDate - createdDate) / (1000 * 60 * 60 * 24); // days
+        return sum + processingTime;
+      }, 0);
+      avgProcessingTime = parseFloat((totalProcessingTime / processedOrders.length).toFixed(1));
+    }
+    
+    // Orders by distributor
+    const ordersByDistributor = await Order.aggregate([
+      { $match: dateFilter },
+      { 
+        $lookup: {
+          from: 'distributors',
+          localField: 'distributorId',
+          foreignField: '_id',
+          as: 'distributorInfo'
+        } 
+      },
+      { $unwind: '$distributorInfo' },
+      { $group: { _id: '$distributorId', name: { $first: '$distributorInfo.name' }, orders: { $sum: 1 } } },
+      { $project: { _id: 0, name: 1, orders: 1 } },
+      { $sort: { orders: -1 } },
+      { $limit: 6 }
+    ]);
+    
+    // Order status distribution
+    const orderStatusDistribution = [
+      { name: 'Approved', value: approvedOrders },
+      { name: 'Pending', value: pendingOrders },
+      { name: 'Rejected', value: rejectedOrders },
+      { name: 'Dispatched', value: dispatchedOrders }
+    ];
+    
+    // Monthly order trend
+    const orderTrend = await getMonthlyTrendData(
+      Order,
+      dateFilter,
+      (results) => {
+        return results.map(month => ({
+          month: month.month,
+          requested: month.total,
+          approved: month.approved,
+          dispatched: month.dispatched || 0
+        }));
+      }
+    );
+    
+    // Monthly fulfillment rate trend
+    const fulfillmentTrend = await getMonthlyTrendData(
+      Order,
+      dateFilter,
+      (results) => {
+        return results.map(month => {
+          const fulfillmentRate = month.total > 0 
+            ? Math.round(((month.approved + (month.dispatched || 0)) / month.total) * 100) 
+            : 0;
+          return {
+            month: month.month,
+            fulfillmentRate
+          };
+        });
+      }
+    );
+
+    // Top ordered products
+    const topProducts = await Order.aggregate([
+      { $match: dateFilter },
+      { $unwind: '$items' },
+      { $group: { 
+        _id: '$items.productName', 
+        orders: { $sum: 1 },
+        quantity: { $sum: '$items.quantity' }
+      }},
+      { $project: { 
+        _id: 0, 
+        name: '$_id', 
+        orders: 1,
+        quantity: 1,
+        value: { $multiply: ['$orders', '$quantity'] }
+      }},
+      { $sort: { orders: -1 } },
+      { $limit: 5 }
+    ]);
+
+    res.status(200).json({
+      totalOrders,
+      approvedOrders,
+      rejectedOrders,
+      pendingOrders,
+      dispatchedOrders,
+      fulfillmentRate,
+      avgProcessingTime,
+      ordersByDistributor,
+      orderStatusDistribution,
+      orderTrend,
+      fulfillmentTrend,
+      topProducts
+    });
+  } catch (error) {
+    console.error('Error getting order analytics:', error);
+    res.status(500).json({ message: 'Error getting order analytics' });
+  }
+};
+
+/**
+ * Get analytics for staff activity
+ */
+exports.getStaffActivityAnalytics = async (req, res) => {
+  try {
+    const { timeRange } = req.query;
+    const dateFilter = getDateFilterFromTimeRange(timeRange);
+
+    // Total activities count
+    const totalActivities = await StaffActivity.countDocuments(dateFilter);
+    
+    // Activities by status
+    const completedActivities = await StaffActivity.countDocuments({ 
+      ...dateFilter, 
+      status: 'Completed' 
+    });
+    const pendingActivities = await StaffActivity.countDocuments({ 
+      ...dateFilter, 
+      status: 'Pending' 
+    });
+    const inProgressActivities = await StaffActivity.countDocuments({ 
+      ...dateFilter, 
+      status: 'In Progress' 
+    });
+    
+    // Average productivity
+    const avgProductivity = totalActivities > 0 
+      ? Math.round((completedActivities / totalActivities) * 100) 
+      : 0;
+    
+    // Activity by staff member with proper name handling
+    const activityByStaff = await StaffActivity.aggregate([
+      { $match: dateFilter },
+      { 
+        $lookup: {
+          from: 'users',
+          localField: 'staffId',
+          foreignField: '_id',
+          as: 'staffInfo'
+        } 
+      },
+      { 
+        $addFields: {
+          staffData: { $arrayElemAt: ['$staffInfo', 0] }
+        }
+      },
+      { 
+        $group: { 
+          _id: '$staffId', 
+          staffData: { $first: '$staffData' },
+          activities: { $sum: 1 },
+          completed: { $sum: { $cond: [{ $eq: ['$status', 'Completed'] }, 1, 0] } }
+        }
+      },
+      { 
+        $project: { 
+          _id: 0,
+          staffId: '$_id',
+          name: { 
+            $cond: {
+              if: { $and: ['$staffData.firstName', '$staffData.lastName'] },
+              then: { $concat: ['$staffData.firstName', ' ', '$staffData.lastName'] },
+              else: {
+                $cond: {
+                  if: '$staffData.name',
+                  then: '$staffData.name',
+                  else: {
+                    $cond: {
+                      if: '$staffData.firstName',
+                      then: '$staffData.firstName',
+                      else: {
+                        $concat: ['Staff ', { $substr: [{ $toString: '$_id' }, -6, 6] }]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          activities: 1,
+          productivity: { 
+            $cond: [
+              { $gt: ['$activities', 0] },
+              { $multiply: [{ $divide: ['$completed', '$activities'] }, 100] },
+              0
+            ]
+          }
+        }
+      },
+      { $sort: { activities: -1 } },
+      { $limit: 10 }
+    ]);
+    
+    // Activity by type
+    const activityByType = await StaffActivity.aggregate([
+      { $match: dateFilter },
+      { $group: { _id: '$activityType', value: { $sum: 1 } } },
+      { $project: { _id: 0, name: '$_id', value: 1 } },
+      { $sort: { value: -1 } }
+    ]);
+    
+    // Monthly activity trend
+    const activityTrend = await getMonthlyActivityTrend(dateFilter);
+    
+    // Staff productivity with proper name handling
+    const staffWithActivity = await StaffActivity.distinct('staffId', dateFilter);
+    const productivityByStaff = await Promise.all(
+      staffWithActivity.map(async (staffId) => {
+        const staffActivities = await StaffActivity.find({ 
+          ...dateFilter, 
+          staffId 
+        });
+        
+        const totalActivities = staffActivities.length;
+        const completedActivities = staffActivities.filter(a => a.status === 'Completed').length;
+        
+        const productivity = totalActivities > 0 
+          ? Math.round((completedActivities / totalActivities) * 100) 
+          : 0;
+        
+        const staff = await User.findById(staffId);
+        let name = 'Unknown Staff';
+        
+        if (staff) {
+          if (staff.firstName && staff.lastName) {
+            name = `${staff.firstName} ${staff.lastName}`;
+          } else if (staff.name) {
+            name = staff.name;
+          } else if (staff.firstName) {
+            name = staff.firstName;
+          } else if (staff.email) {
+            name = staff.email.split('@')[0]; // Use email prefix as fallback
+          } else {
+            name = `Staff ${staffId.toString().slice(-6)}`;
+          }
+        }
+        
+        return { name, productivity };
+      })
+    );
+    
+    // Sort by productivity in descending order
+    productivityByStaff.sort((a, b) => b.productivity - a.productivity);
+    
+    // Top performers with enhanced name handling
+    const topPerformers = await generateTopPerformers(dateFilter);
+
+    res.status(200).json({
+      totalActivities,
+      completedActivities,
+      pendingActivities,
+      inProgressActivities,
+      avgProductivity,
+      activityByStaff,
+      activityByType,
+      activityTrend,
+      productivityByStaff,
+      topPerformers
+    });
+  } catch (error) {
+    console.error('Error getting staff activity analytics:', error);
+    res.status(500).json({ message: 'Error getting staff activity analytics', details: error.message });
+  }
+};
+
+/**
+ * Get date filter object from time range string
+ * @param {string} timeRange - Time range string (e.g., 'last7days', 'last30days')
+ * @returns {Object} Date filter object
+ */
+const getDateFilterFromTimeRange = (timeRange) => {
+  const now = new Date();
+  let startDate;
+  
+  switch (timeRange) {
+    case 'last7days':
+      startDate = new Date(now);
+      startDate.setDate(startDate.getDate() - 7);
+      break;
+    case 'last30days':
+      startDate = new Date(now);
+      startDate.setDate(startDate.getDate() - 30);
+      break;
+    case 'last3months':
+      startDate = new Date(now);
+      startDate.setMonth(startDate.getMonth() - 3);
+      break;
+    case 'last6months':
+      startDate = new Date(now);
+      startDate.setMonth(startDate.getMonth() - 6);
+      break;
+    case 'lastYear':
+      startDate = new Date(now);
+      startDate.setFullYear(startDate.getFullYear() - 1);
+      break;
+    default:
+      // Default to last 30 days
+      startDate = new Date(now);
+      startDate.setDate(startDate.getDate() - 30);
+  }
+  
+  return { createdAt: { $gte: startDate, $lte: now } };
+};
+
+/**
+ * Get monthly trend data
+ * @param {Model} model - Mongoose model
+ * @param {Object} filter - Filter object
+ * @param {Function} transformer - Function to transform the results
+ * @returns {Array} Monthly trend data
+ */
+const getMonthlyTrendData = async (model, filter, transformer) => {
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const now = new Date();
+  const currentMonth = now.getMonth(); // 0-indexed (0 = January)
+  const currentYear = now.getFullYear();
+  
+  // Get data for the last 6 months
+  const monthlyData = [];
+  
+  for (let i = 5; i >= 0; i--) {
+    let month = currentMonth - i;
+    let year = currentYear;
+    
+    if (month < 0) {
+      month += 12;
+      year -= 1;
+    }
+    
+    const startDate = new Date(year, month, 1);
+    const endDate = new Date(year, month + 1, 0); // Last day of the month
+    
+    const monthlyFilter = {
+      ...filter,
+      createdAt: { $gte: startDate, $lte: endDate }
+    };
+    
+    const totalCount = await model.countDocuments(monthlyFilter);
+    
+    let approvedCount = 0;
+    let rejectedCount = 0;
+    let dispatchedCount = 0;
+    
+    if (model.modelName === 'DamageClaim') {
+      approvedCount = await model.countDocuments({
+        ...monthlyFilter,
+        status: { $in: ['Approved', 'Partially Approved'] }
+      });
+      rejectedCount = await model.countDocuments({
+        ...monthlyFilter,
+        status: 'Rejected'
+      });
+    } else if (model.modelName === 'Order') {
+      approvedCount = await model.countDocuments({
+        ...monthlyFilter,
+        status: 'Approved'
+      });
+      rejectedCount = await model.countDocuments({
+        ...monthlyFilter,
+        status: 'Rejected'
+      });
+      dispatchedCount = await model.countDocuments({
+        ...monthlyFilter,
+        status: 'Dispatched'
+      });
+    }
+    
+    monthlyData.push({
+      month: months[month],
+      year,
+      total: totalCount,
+      approved: approvedCount,
+      rejected: rejectedCount,
+      dispatched: dispatchedCount
+    });
+  }
+  
+  return transformer ? transformer(monthlyData) : monthlyData;
+};
+
+/**
+ * Get monthly activity trend by type
+ * @param {Object} dateFilter - Date filter object
+ * @returns {Array} Monthly activity trend data
+ */
+const getMonthlyActivityTrend = async (dateFilter) => {
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const now = new Date();
+  const currentMonth = now.getMonth();
+  const currentYear = now.getFullYear();
+  
+  const monthlyData = [];
+  
+  for (let i = 5; i >= 0; i--) {
+    let month = currentMonth - i;
+    let year = currentYear;
+    
+    if (month < 0) {
+      month += 12;
+      year -= 1;
+    }
+    
+    const startDate = new Date(year, month, 1);
+    const endDate = new Date(year, month + 1, 0);
+    
+    const monthlyFilter = {
+      ...dateFilter,
+      createdAt: { $gte: startDate, $lte: endDate }
+    };
+    
+    // Get counts by activity type
+    const taskCount = await StaffActivity.countDocuments({
+      ...monthlyFilter,
+      activityType: 'Task'
+    });
+    
+    const orderCount = await StaffActivity.countDocuments({
+      ...monthlyFilter,
+      activityType: 'Order'
+    });
+    
+    const damageClaimCount = await StaffActivity.countDocuments({
+      ...monthlyFilter,
+      activityType: 'Damage Claim'
+    });
+    
+    monthlyData.push({
+      month: months[month],
+      tasks: taskCount,
+      orders: orderCount,
+      damageClaims: damageClaimCount
+    });
+  }
+  
+  return monthlyData;
+};
+
+/**
+ * Generate top performers data
+ * @param {Object} dateFilter - Date filter object
+ * @returns {Array} Top performers data
+ */
+const generateTopPerformers = async (dateFilter) => {
+  // Get all staff with activity
+  const staffWithActivity = await StaffActivity.distinct('staffId', dateFilter);
+  
+  const performanceData = await Promise.all(
+    staffWithActivity.map(async (staffId) => {
+      // Get staff details
+      const staff = await User.findById(staffId);
+      if (!staff) return null;
+      
+      // Get staff activities
+      const activities = await StaffActivity.find({ 
+        ...dateFilter, 
+        staffId 
+      });
+      
+      const totalActivities = activities.length;
+      if (totalActivities === 0) return null;
+      
+      const completedActivities = activities.filter(a => a.status === 'Completed').length;
+      const completionRate = Math.round((completedActivities / totalActivities) * 100);
+      
+      // Calculate average response time (placeholder calculation)
+      // In a real system, you'd have more precise timestamps for activity lifecycle
+      const responseTimes = activities.map(activity => {
+        const createdDate = new Date(activity.createdAt);
+        const completedDate = activity.status === 'Completed' 
+          ? new Date(activity.updatedAt)
+          : new Date(); // Use current time for non-completed activities
+        return (completedDate - createdDate) / (1000 * 60); // minutes
+      });
+      
+      const avgResponseTime = responseTimes.length > 0
+        ? Math.round(responseTimes.reduce((sum, time) => sum + time, 0) / responseTimes.length)
+        : 0;
+      
+      // Calculate productivity score (custom formula)
+      // 50% based on completion rate, 30% on volume, 20% on response time
+      const volumeScore = Math.min(totalActivities / 100 * 100, 100); // Cap at 100
+      const responseTimeScore = Math.max(0, 100 - (avgResponseTime / 120 * 100)); // Lower is better, cap at 2 hours
+      
+      const productivityScore = Math.round(
+        completionRate * 0.5 +
+        volumeScore * 0.3 +
+        responseTimeScore * 0.2
+      );
+      
+      // Enhanced name handling with multiple fallbacks
+      let name = 'Unknown Staff';
+      if (staff.firstName && staff.lastName) {
+        name = `${staff.firstName} ${staff.lastName}`;
+      } else if (staff.name) {
+        name = staff.name;
+      } else if (staff.firstName) {
+        name = staff.firstName;
+      } else if (staff.lastName) {
+        name = staff.lastName;
+      } else if (staff.email) {
+        name = staff.email.split('@')[0]; // Use email prefix as fallback
+      } else {
+        name = `Staff ${staffId.toString().slice(-6)}`;
+      }
+      
+      return {
+        staffId: staffId.toString(),
+        name,
+        activities: totalActivities,
+        completionRate,
+        avgResponseTime: `${avgResponseTime} min`,
+        productivityScore
+      };
+    })
+  );
+  
+  // Remove null entries and sort by productivity score
+  return performanceData
+    .filter(data => data !== null)
+    .sort((a, b) => b.productivityScore - a.productivityScore)
+    .slice(0, 5);
+};
+
+/**
+ * Get overview analytics for dashboard
+ */
+exports.getOverviewAnalytics = async (req, res) => {
+  try {
+    const { timeRange } = req.query;
+    const dateFilter = getDateFilterFromTimeRange(timeRange || 'last30days');
+
+    // Get counts
+    const damageClaimsCount = await DamageClaim.countDocuments(dateFilter);
+    const ordersCount = await Order.countDocuments(dateFilter);
+    const activitiesCount = await StaffActivity.countDocuments(dateFilter);
+    
+    // Get approval/fulfillment rates
+    const approvedClaims = await DamageClaim.countDocuments({ 
+      ...dateFilter, 
+      status: { $in: ['Approved', 'Partially Approved'] } 
+    });
+    const claimsApprovalRate = damageClaimsCount > 0 
+      ? Math.round((approvedClaims / damageClaimsCount) * 100) 
+      : 0;
+    
+    const approvedOrders = await Order.countDocuments({ 
+      ...dateFilter, 
+      status: { $in: ['Approved', 'Dispatched'] } 
+    });
+    const orderFulfillmentRate = ordersCount > 0 
+      ? Math.round((approvedOrders / ordersCount) * 100) 
+      : 0;
+    
+    const completedActivities = await StaffActivity.countDocuments({ 
+      ...dateFilter, 
+      status: 'Completed' 
+    });
+    const activityProductivity = activitiesCount > 0 
+      ? Math.round((completedActivities / activitiesCount) * 100) 
+      : 0;
+    
+    // Get monthly trend data
+    const monthlyData = await getMonthlyTrendData(
+      DamageClaim,
+      dateFilter,
+      (results) => {
+        return results.map(month => ({
+          month: month.month,
+          damageClaimsCount: month.total
+        }));
+      }
+    );
+    
+    // Add orders data to monthly trend
+    const orderMonthlyData = await getMonthlyTrendData(
+      Order,
+      dateFilter,
+      (results) => {
+        return results.map(month => ({
+          month: month.month,
+          orderCount: month.total
+        }));
+      }
+    );
+    
+    // Combine monthly data
+    const combinedMonthlyData = monthlyData.map((item, index) => {
+      return {
+        ...item,
+        orderCount: orderMonthlyData[index].orderCount
+      };
+    });
+    
+    // Add activity data to monthly trend
+    const activityMonthly = await getMonthlyTrendData(
+      StaffActivity,
+      dateFilter,
+      (results) => {
+        return results.map(month => ({
+          month: month.month,
+          activityCount: month.total
+        }));
+      }
+    );
+    
+    combinedMonthlyData.forEach((item, index) => {
+      item.activityCount = activityMonthly[index].activityCount;
+    });
+
+    res.status(200).json({
+      damageClaimsCount,
+      ordersCount,
+      activitiesCount,
+      claimsApprovalRate,
+      orderFulfillmentRate,
+      activityProductivity,
+      combinedMonthlyData
+    });
+  } catch (error) {
+    console.error('Error getting overview analytics:', error);
+    res.status(500).json({ message: 'Error getting overview analytics' });
+  }
+};
+
+/**
+ * Get market inquiry analytics for retailers/wholesalers under distributors
+ */
+exports.getMarketInquiryAnalytics = async (req, res) => {
+  try {
+    const { timeRange, distributorId, brandName, variant, frequencyType } = req.query;
+    const dateFilter = getDateFilterFromTimeRange(timeRange || 'last30days');
+
+    // Build match query for market inquiries
+    const matchQuery = {
+      createdAt: dateFilter.createdAt,
+      marketInquiries: { $exists: true, $not: { $size: 0 } }
+    };
+
+    if (distributorId) {
+      matchQuery.distributorId = mongoose.Types.ObjectId(distributorId);
+    }
+
+    // Aggregate market inquiry data
+    const inquiryAnalytics = await RetailerShopActivity.aggregate([
+      { $match: matchQuery },
+      { $unwind: '$marketInquiries' },
+      {
+        $match: {
+          ...(brandName && { 'marketInquiries.brandName': brandName }),
+          ...(variant && { 'marketInquiries.variant': variant }),
+          ...(frequencyType && { 'marketInquiries.frequencyOfInquiry': frequencyType })
+        }
+      },
+      {
+        $group: {
+          _id: {
+            distributorId: '$distributorId',
+            shopId: '$shopId',
+            brandName: '$marketInquiries.brandName',
+            variant: '$marketInquiries.variant',
+            inquiryType: '$marketInquiries.inquiryType',
+            frequencyOfInquiry: '$marketInquiries.frequencyOfInquiry'
+          },
+          totalInquiries: { $sum: 1 },
+          avgExpectedQuantity: { $avg: '$marketInquiries.expectedQuantity' },
+          highDemandCount: {
+            $sum: { $cond: [{ $eq: ['$marketInquiries.customerDemand', 'High'] }, 1, 0] }
+          },
+          followUpRequired: {
+            $sum: { $cond: ['$marketInquiries.followUpRequired', 1, 0] }
+          },
+          lastInquiryDate: { $max: '$createdAt' }
+        }
+      },
+      {
+        $lookup: {
+          from: 'distributors',
+          localField: '_id.distributorId',
+          foreignField: '_id',
+          as: 'distributor'
+        }
+      },
+      {
+        $lookup: {
+          from: 'shops',
+          localField: '_id.shopId',
+          foreignField: '_id',
+          as: 'shop'
+        }
+      },
+      {
+        $project: {
+          distributorName: { $arrayElemAt: ['$distributor.name', 0] },
+          shopName: { $arrayElemAt: ['$shop.name', 0] },
+          shopType: { $arrayElemAt: ['$shop.type', 0] },
+          brandName: '$_id.brandName',
+          variant: '$_id.variant',
+          inquiryType: '$_id.inquiryType',
+          frequencyOfInquiry: '$_id.frequencyOfInquiry',
+          totalInquiries: 1,
+          avgExpectedQuantity: { $round: ['$avgExpectedQuantity', 0] },
+          highDemandPercentage: {
+            $round: [{ $multiply: [{ $divide: ['$highDemandCount', '$totalInquiries'] }, 100] }, 1]
+          },
+          followUpRequiredCount: '$followUpRequired',
+          lastInquiryDate: 1
+        }
+      },
+      { $sort: { totalInquiries: -1, lastInquiryDate: -1 } }
+    ]);
+
+    // Get frequency distribution
+    const frequencyDistribution = await RetailerShopActivity.aggregate([
+      { $match: matchQuery },
+      { $unwind: '$marketInquiries' },
+      {
+        $group: {
+          _id: '$marketInquiries.frequencyOfInquiry',
+          count: { $sum: 1 }
+        }
+      },
+      {
+        $project: {
+          frequency: '$_id',
+          count: 1,
+          _id: 0
+        }
+      },
+      { $sort: { count: -1 } }
+    ]);
+
+    // Get top brands by inquiry volume
+    const topBrandsByInquiry = await RetailerShopActivity.aggregate([
+      { $match: matchQuery },
+      { $unwind: '$marketInquiries' },
+      {
+        $group: {
+          _id: {
+            brandName: '$marketInquiries.brandName',
+            variant: '$marketInquiries.variant'
+          },
+          totalInquiries: { $sum: 1 },
+          uniqueShops: { $addToSet: '$shopId' },
+          uniqueDistributors: { $addToSet: '$distributorId' }
+        }
+      },
+      {
+        $project: {
+          brandVariant: { $concat: ['$_id.brandName', ' - ', '$_id.variant'] },
+          totalInquiries: 1,
+          shopCount: { $size: '$uniqueShops' },
+          distributorCount: { $size: '$uniqueDistributors' },
+          _id: 0
+        }
+      },
+      { $sort: { totalInquiries: -1 } },
+      { $limit: 10 }
+    ]);
+
+    // Get inquiry trend over time
+    const inquiryTrend = await getMonthlyTrendData(
+      RetailerShopActivity,
+      { ...matchQuery, marketInquiries: { $exists: true, $not: { $size: 0 } } },
+      async (results) => {
+        return results.map(month => ({
+          month: month.month,
+          inquiries: month.total
+        }));
+      }
+    );
+
+    res.status(200).json({
+      success: true,
+      data: {
+        inquiryAnalytics,
+        frequencyDistribution,
+        topBrandsByInquiry,
+        inquiryTrend,
+        summary: {
+          totalActivitiesWithInquiries: inquiryAnalytics.length,
+          totalInquiries: inquiryAnalytics.reduce((sum, item) => sum + item.totalInquiries, 0),
+          avgInquiriesPerShop: inquiryAnalytics.length > 0 
+            ? Math.round(inquiryAnalytics.reduce((sum, item) => sum + item.totalInquiries, 0) / inquiryAnalytics.length)
+            : 0
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error getting market inquiry analytics:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error getting market inquiry analytics',
+      error: error.message 
+    });
+  }
+};
+
+/**
+ * Get dashboard summary analytics
+ */
+exports.getDashboardSummary = async (req, res) => {
+  try {
+    // Get current date and date for 30 days ago
+    const today = new Date();
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    
+    // Date filter for last 30 days
+    const dateFilter = { createdAt: { $gte: thirtyDaysAgo, $lte: today } };
+    
+    // Get active staff count (staff who have logged in or had activity in the last 30 days)
+    const activeStaffCount = await User.countDocuments({
+      role: { $in: ['Marketing Staff', 'Godown Incharge'] },
+      $or: [
+        { lastLogin: { $gte: thirtyDaysAgo } },
+        { updatedAt: { $gte: thirtyDaysAgo } }
+      ]
+    });
+    
+    // Get total staff count
+    const totalStaffCount = await User.countDocuments({
+      role: { $in: ['Marketing Staff', 'Godown Incharge'] }
+    });
+    
+    // Get active distributors (distributors with activity in the last 30 days)
+    const activeDistributorIds = await MarketingStaffActivity.distinct('distributorId', dateFilter);
+    const activeDistributorCount = activeDistributorIds.length;
+    
+    // Get total distributors count
+    const totalDistributorCount = await Distributor.countDocuments();
+    
+    // Get total shops count
+    const totalShopCount = await Shop.countDocuments({ isActive: true });
+    
+    // Get active shops (shops with activity in the last 30 days)
+    const retailerShopActivities = await RetailerShopActivity.find(dateFilter)
+      .select('shopId')
+      .lean();
+    
+    const activeShopIds = new Set();
+    retailerShopActivities.forEach(activity => {
+      if (activity.shopId) {
+        activeShopIds.add(activity.shopId.toString());
+      }
+    });
+    const activeShopCount = activeShopIds.size;
+    
+    // Get total sales orders in the last 30 days
+    const salesOrdersCount = await RetailerShopActivity.aggregate([
+      { $match: dateFilter },
+      { $project: { salesOrdersCount: { $size: { $ifNull: ['$salesOrders', []] } } } },
+      { $group: { _id: null, totalOrders: { $sum: '$salesOrdersCount' } } }
+    ]);
+    
+    const totalSalesOrders = salesOrdersCount.length > 0 ? salesOrdersCount[0].totalOrders : 0;
+    
+    // Get total sales value in the last 30 days
+    const salesValueResult = await RetailerShopActivity.aggregate([
+      { $match: dateFilter },
+      { $unwind: { path: '$salesOrders', preserveNullAndEmptyArrays: false } },
+      { 
+        $project: { 
+          orderValue: { 
+            $multiply: [
+              { $ifNull: ['$salesOrders.quantity', 0] }, 
+              { $ifNull: ['$salesOrders.rate', 0] }
+            ] 
+          } 
+        } 
+      },
+      { $group: { _id: null, totalValue: { $sum: '$orderValue' } } }
+    ]);
+    
+    const totalSalesValue = salesValueResult.length > 0 ? Math.round(salesValueResult[0].totalValue) : 0;
+    
+    // Get total damage claims in the last 30 days
+    const totalDamageClaims = await DamageClaim.countDocuments(dateFilter);
+    
+    // Get total damage claims value in the last 30 days
+    const damageClaimsValueResult = await DamageClaim.aggregate([
+      { $match: dateFilter },
+      { 
+        $group: { 
+          _id: null, 
+          totalValue: { 
+            $sum: { 
+              $multiply: [
+                { $ifNull: ['$quantity', 0] }, 
+                { $ifNull: ['$rate', 0] }
+              ] 
+            } 
+          } 
+        } 
+      }
+    ]);
+    
+    const totalDamageClaimsValue = damageClaimsValueResult.length > 0 ? 
+      Math.round(damageClaimsValueResult[0].totalValue) : 0;
+    
+    // Calculate staff activity metrics
+    const staffActivities = await MarketingStaffActivity.find(dateFilter);
+    
+    let totalVisits = staffActivities.length;
+    let completedVisits = staffActivities.filter(a => a.status === 'Completed').length;
+    let visitCompletionRate = totalVisits > 0 ? Math.round((completedVisits / totalVisits) * 100) : 0;
+    
+    // Calculate average visit duration (in minutes)
+    let totalDuration = 0;
+    let visitsWithDuration = 0;
+    
+    staffActivities.forEach(activity => {
+      if (activity.meetingStartTime && activity.meetingEndTime) {
+        const startTime = new Date(activity.meetingStartTime);
+        const endTime = new Date(activity.meetingEndTime);
+        const durationMinutes = (endTime - startTime) / (1000 * 60);
+        
+        if (durationMinutes > 0) {
+          totalDuration += durationMinutes;
+          visitsWithDuration++;
+        }
+      }
+    });
+    
+    const avgVisitDuration = visitsWithDuration > 0 ? 
+      Math.round(totalDuration / visitsWithDuration) : 0;
+    
+    res.status(200).json({
+      success: true,
+      data: {
+        staffMetrics: {
+          activeStaff: activeStaffCount,
+          totalStaff: totalStaffCount,
+          activePercentage: totalStaffCount > 0 ? 
+            Math.round((activeStaffCount / totalStaffCount) * 100) : 0
+        },
+        distributorMetrics: {
+          activeDistributors: activeDistributorCount,
+          totalDistributors: totalDistributorCount,
+          activePercentage: totalDistributorCount > 0 ? 
+            Math.round((activeDistributorCount / totalDistributorCount) * 100) : 0
+        },
+        shopMetrics: {
+          activeShops: activeShopCount,
+          totalShops: totalShopCount,
+          activePercentage: totalShopCount > 0 ? 
+            Math.round((activeShopCount / totalShopCount) * 100) : 0
+        },
+        salesMetrics: {
+          totalOrders: totalSalesOrders,
+          totalValue: totalSalesValue,
+          averageOrderValue: totalSalesOrders > 0 ? 
+            Math.round(totalSalesValue / totalSalesOrders) : 0
+        },
+        damageMetrics: {
+          totalClaims: totalDamageClaims,
+          totalValue: totalDamageClaimsValue,
+          averageClaimValue: totalDamageClaims > 0 ? 
+            Math.round(totalDamageClaimsValue / totalDamageClaims) : 0
+        },
+        activityMetrics: {
+          totalVisits,
+          completedVisits,
+          visitCompletionRate,
+          avgVisitDuration
+        }
+      }
+    });
+  } catch (error) {
+    logger.error(`Error in getDashboardSummary: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      error: 'Server error in fetching dashboard summary'
+    });
+  }
+};
+
+/**
+ * Get brand order analytics
+ */
+exports.getBrandOrderAnalytics = async (req, res) => {
+  try {
+    const { timeRange, brandName, distributorId, staffId, variant } = req.query;
+    const dateFilter = getDateFilterFromTimeRange(timeRange);
+    
+    // Build match query
+    let matchQuery = { ...dateFilter };
+    
+    // Staff filter - get distributors assigned to staff
+    if (staffId) {
+      try {
+        const staffAssignment = await StaffDistributorAssignment.findOne({
+          staffId: new mongoose.Types.ObjectId(staffId),
+          isActive: true
+        });
+        
+        if (staffAssignment && staffAssignment.distributorIds.length > 0) {
+          matchQuery.distributorId = { $in: staffAssignment.distributorIds };
+        } else {
+          // Staff has no distributors assigned, return empty results
+          return res.status(200).json({
+            success: true,
+            data: {
+              brandOrderAnalytics: [],
+              distributorBrandPerformance: [],
+              brandOrderTrend: [],
+              topBrands: [],
+              summary: {
+                totalBrandOrders: 0,
+                uniqueBrands: 0,
+                uniqueDistributors: 0
+              }
+            }
+          });
+        }
+      } catch (err) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid staff ID format'
+        });
+      }
+    }
+    
+    // Distributor filter - support multiple distributors
+    if (distributorId) {
+      try {
+        const distributorIds = Array.isArray(distributorId) ? distributorId : [distributorId];
+        const objectIds = distributorIds.map(id => new mongoose.Types.ObjectId(id));
+        
+        if (matchQuery.distributorId) {
+          // If staff filter already applied, intersect with selected distributors
+          matchQuery.distributorId = { $in: matchQuery.distributorId.$in.filter(id => 
+            objectIds.some(selectedId => selectedId.equals(id))
+          )};
+        } else {
+          matchQuery.distributorId = { $in: objectIds };
+        }
+      } catch (err) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid distributor ID format'
+        });
+      }
+    }
+    
+    // Additional filters for sales orders
+    const salesOrderFilters = {};
+    if (brandName) salesOrderFilters['salesOrders.brandName'] = brandName;
+    if (variant) salesOrderFilters['salesOrders.variant'] = variant;
+    
+    // Combine all filters
+    const combinedFilter = { ...matchQuery, ...salesOrderFilters };
+    
+    // Get detailed brand order analytics for the table
+    const brandOrderAnalytics = await RetailerShopActivity.aggregate([
+      { $match: combinedFilter },
+      { $unwind: { path: '$salesOrders', preserveNullAndEmptyArrays: false } },
+      {
+        $lookup: {
+          from: 'distributors',
+          localField: 'distributorId',
+          foreignField: '_id',
+          as: 'distributorDetails'
+        }
+      },
+      {
+        $lookup: {
+          from: 'shops',
+          localField: 'shopId',
+          foreignField: '_id',
+          as: 'shopDetails'
+        }
+      },
+      {
+        $group: {
+          _id: {
+            distributorId: '$distributorId',
+            brandName: '$salesOrders.brandName',
+            variant: '$salesOrders.variant',
+            size: '$salesOrders.size'
+          },
+          distributorName: { $first: { $arrayElemAt: ['$distributorDetails.name', 0] } },
+          totalOrders: { $sum: 1 },
+          totalQuantity: { $sum: { $ifNull: ['$salesOrders.quantity', 0] } },
+          totalValue: { 
+            $sum: { 
+              $multiply: [
+                { $ifNull: ['$salesOrders.quantity', 0] }, 
+                { $ifNull: ['$salesOrders.rate', 0] }
+              ] 
+            } 
+          },
+          avgRate: { $avg: { $ifNull: ['$salesOrders.rate', 0] } },
+          shopCount: { $addToSet: '$shopId' },
+          lastOrderDate: { $max: '$createdAt' },
+          firstOrderDate: { $min: '$createdAt' },
+          // Separate retailers and wholesalers
+          retailers: {
+            $push: {
+              $cond: [
+                { $eq: [{ $arrayElemAt: ['$shopDetails.shopType', 0] }, 'Retailer'] },
+                {
+                  shopId: '$shopId',
+                  shopName: { $arrayElemAt: ['$shopDetails.shopName', 0] },
+                  quantity: '$salesOrders.quantity',
+                  value: { $multiply: ['$salesOrders.quantity', '$salesOrders.rate'] },
+                  orderDate: '$createdAt'
+                },
+                null
+              ]
+            }
+          },
+          wholesalers: {
+            $push: {
+              $cond: [
+                { $eq: [{ $arrayElemAt: ['$shopDetails.shopType', 0] }, 'Wholesaler'] },
+                {
+                  shopId: '$shopId',
+                  shopName: { $arrayElemAt: ['$shopDetails.shopName', 0] },
+                  quantity: '$salesOrders.quantity',
+                  value: { $multiply: ['$salesOrders.quantity', '$salesOrders.rate'] },
+                  orderDate: '$createdAt'
+                },
+                null
+              ]
+            }
+          }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          distributorId: '$_id.distributorId',
+          distributorName: { $ifNull: ['$distributorName', 'Unknown Distributor'] },
+          brandName: '$_id.brandName',
+          variant: '$_id.variant',
+          size: '$_id.size',
+          totalOrders: 1,
+          totalQuantity: 1,
+          totalValue: { $round: ['$totalValue', 2] },
+          avgQuantityPerOrder: { 
+            $round: [{ $divide: ['$totalQuantity', '$totalOrders'] }, 2] 
+          },
+          avgRate: { $round: ['$avgRate', 2] },
+          shopCount: { $size: '$shopCount' },
+          lastOrderDate: 1,
+          firstOrderDate: 1,
+          // Calculate order frequency
+          orderFrequency: {
+            $switch: {
+              branches: [
+                { case: { $gte: ['$totalOrders', 20] }, then: 'Very High' },
+                { case: { $gte: ['$totalOrders', 10] }, then: 'High' },
+                { case: { $gte: ['$totalOrders', 5] }, then: 'Medium' },
+                { case: { $gte: ['$totalOrders', 1] }, then: 'Low' }
+              ],
+              default: 'None'
+            }
+          },
+          // Filter out null values from retailers and wholesalers
+          retailers: {
+            $filter: {
+              input: '$retailers',
+              cond: { $ne: ['$$this', null] }
+            }
+          },
+          wholesalers: {
+            $filter: {
+              input: '$wholesalers',
+              cond: { $ne: ['$$this', null] }
+            }
+          }
+        }
+      },
+      { $sort: { totalValue: -1 } }
+    ]);
+    
+    // Get total orders and value by brand
+    const ordersByBrand = await RetailerShopActivity.aggregate([
+      { $match: combinedFilter },
+      { $unwind: { path: '$salesOrders', preserveNullAndEmptyArrays: false } },
+      {
+        $group: {
+          _id: '$salesOrders.brandName',
+          totalOrders: { $sum: 1 },
+          totalQuantity: { $sum: { $ifNull: ['$salesOrders.quantity', 0] } },
+          totalValue: { 
+            $sum: { 
+              $multiply: [
+                { $ifNull: ['$salesOrders.quantity', 0] }, 
+                { $ifNull: ['$salesOrders.rate', 0] }
+              ] 
+        }
+          }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          brandName: '$_id',
+          totalOrders: 1,
+          totalQuantity: 1,
+          totalValue: { $round: ['$totalValue', 2] },
+          averageOrderValue: { 
+            $round: [
+              { $divide: ['$totalValue', '$totalOrders'] }, 
+              2
+            ] 
+            }
+        }
+      },
+      { $sort: { totalValue: -1 } }
+    ]);
+
+    // Get orders by variant for each brand
+    const brandVariantData = await RetailerShopActivity.aggregate([
+      { $match: combinedFilter },
+      { $unwind: { path: '$salesOrders', preserveNullAndEmptyArrays: false } },
+      {
+        $group: {
+          _id: {
+            brand: '$salesOrders.brandName', 
+            variant: '$salesOrders.variant'
+          },
+          totalOrders: { $sum: 1 },
+          totalQuantity: { $sum: { $ifNull: ['$salesOrders.quantity', 0] } },
+          totalValue: { 
+            $sum: { 
+              $multiply: [
+                { $ifNull: ['$salesOrders.quantity', 0] }, 
+                { $ifNull: ['$salesOrders.rate', 0] }
+              ] 
+        }
+          }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          brandName: '$_id.brand',
+          variant: '$_id.variant',
+          totalOrders: 1,
+          totalQuantity: 1,
+          totalValue: { $round: ['$totalValue', 2] }
+        }
+      },
+      { $sort: { totalValue: -1 } }
+    ]);
+    
+    // Group variant data by brand
+    const brandData = {};
+    
+    ordersByBrand.forEach(brand => {
+      brandData[brand.brandName] = {
+        ...brand,
+        variants: []
+      };
+    });
+    
+    brandVariantData.forEach(variantData => {
+      if (brandData[variantData.brandName]) {
+        brandData[variantData.brandName].variants.push({
+          variant: variantData.variant,
+          totalOrders: variantData.totalOrders,
+          totalQuantity: variantData.totalQuantity,
+          totalValue: variantData.totalValue
+        });
+      }
+    });
+    
+    // Convert to array for response
+    const formattedBrandData = Object.values(brandData);
+
+    // Get monthly trend data for orders
+    const monthlyOrderTrend = await getMonthlyTrendData(
+      RetailerShopActivity,
+      combinedFilter,
+      async (results) => {
+        const monthlyData = [];
+        
+        for (const monthData of results) {
+          // Convert month name to month number (0-indexed)
+          const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+          const monthIndex = monthNames.indexOf(monthData.month);
+          const year = monthData.year;
+          
+          const startDate = new Date(year, monthIndex, 1);
+          const endDate = new Date(year, monthIndex + 1, 0, 23, 59, 59);
+
+          // Get order data for this month
+          const monthlyOrders = await RetailerShopActivity.aggregate([
+            { 
+              $match: { 
+                createdAt: { $gte: startDate, $lte: endDate },
+                ...salesOrderFilters
+              } 
+            },
+            { $unwind: { path: '$salesOrders', preserveNullAndEmptyArrays: false } },
+      {
+        $group: {
+                _id: null,
+          totalOrders: { $sum: 1 },
+          totalQuantity: { $sum: { $ifNull: ['$salesOrders.quantity', 0] } },
+                totalValue: { 
+                  $sum: { 
+                    $multiply: [
+                      { $ifNull: ['$salesOrders.quantity', 0] }, 
+                      { $ifNull: ['$salesOrders.rate', 0] }
+                    ] 
+                  } 
+                }
+              }
+            }
+          ]);
+          
+          const orderCount = monthlyOrders.length > 0 ? monthlyOrders[0].totalOrders : 0;
+          const orderQuantity = monthlyOrders.length > 0 ? monthlyOrders[0].totalQuantity : 0;
+          const orderValue = monthlyOrders.length > 0 ? Math.round(monthlyOrders[0].totalValue) : 0;
+          
+          monthlyData.push({
+            month: `${year}-${(monthIndex + 1).toString().padStart(2, '0')}`,
+            orders: orderCount,
+            quantity: orderQuantity,
+            value: orderValue
+          });
+        }
+        
+        return monthlyData;
+      }
+    );
+    
+    // Get distributor performance data
+    const distributorPerformance = await RetailerShopActivity.aggregate([
+      { $match: combinedFilter },
+      { $unwind: { path: '$salesOrders', preserveNullAndEmptyArrays: false } },
+      {
+        $lookup: {
+          from: 'distributors',
+          localField: 'distributorId',
+          foreignField: '_id',
+          as: 'distributorDetails'
+        }
+      },
+      {
+        $group: {
+          _id: '$distributorId',
+          distributorName: { $first: { $arrayElemAt: ['$distributorDetails.name', 0] } },
+          totalOrders: { $sum: 1 },
+          totalQuantity: { $sum: { $ifNull: ['$salesOrders.quantity', 0] } },
+          totalValue: { 
+            $sum: { 
+              $multiply: [
+                { $ifNull: ['$salesOrders.quantity', 0] }, 
+                { $ifNull: ['$salesOrders.rate', 0] }
+              ] 
+            } 
+          }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          distributorId: '$_id',
+          distributorName: { $ifNull: ['$distributorName', 'Unknown Distributor'] },
+          totalOrders: 1,
+          totalQuantity: 1,
+          totalValue: { $round: ['$totalValue', 2] }
+        }
+      },
+      { $sort: { totalValue: -1 } },
+      { $limit: 10 }
+    ]);
+
+    // Calculate summary statistics
+    const summary = {
+      totalBrandOrders: brandOrderAnalytics.reduce((sum, item) => sum + item.totalOrders, 0),
+      uniqueBrands: [...new Set(brandOrderAnalytics.map(item => item.brandName))].length,
+      uniqueDistributors: [...new Set(brandOrderAnalytics.map(item => item.distributorId.toString()))].length
+    };
+
+    res.status(200).json({
+      success: true,
+      data: {
+        brandOrderAnalytics,
+        distributorBrandPerformance: distributorPerformance,
+        brandOrderTrend: monthlyOrderTrend,
+        topBrands: formattedBrandData,
+        summary
+      }
+    });
+  } catch (error) {
+    logger.error(`Error in getBrandOrderAnalytics: ${error.message}`);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Server error in fetching brand order analytics'
+    });
+  }
+};
+
+/**
+ * Get inventory analysis based on distributor stock vs shop requirements
+ */
+exports.getInventoryAnalysis = async (req, res) => {
+  try {
+    const { timeRange, distributorId, staffId } = req.query;
+    const dateFilter = getDateFilterFromTimeRange(timeRange || 'last30days');
+
+    const matchQuery = {
+      createdAt: dateFilter.createdAt,
+      status: 'Punched Out' // Only consider completed activities
+    };
+
+    if (distributorId) {
+      try {
+        matchQuery.distributorId = new mongoose.Types.ObjectId(distributorId);
+      } catch (err) {
+        return res.status(400).json({ 
+          success: false, 
+          message: 'Invalid distributor ID format'
+        });
+      }
+    }
+
+    if (staffId) {
+      try {
+        matchQuery.marketingStaffId = new mongoose.Types.ObjectId(staffId);
+      } catch (err) {
+        return res.status(400).json({ 
+          success: false, 
+          message: 'Invalid staff ID format'
+        });
+      }
+    }
+
+    // First, get distributor stock levels from MarketingStaffActivity
+    const MarketingStaffActivity = require('../models/MarketingStaffActivity');
+    const stockLevels = await MarketingStaffActivity.aggregate([
+      { $match: matchQuery },
+      { $unwind: '$brandSupplyEstimates' },
+      { $unwind: '$brandSupplyEstimates.variants' },
+      { $unwind: '$brandSupplyEstimates.variants.sizes' },
+      {
+        $group: {
+          _id: {
+            brandName: '$brandSupplyEstimates.name',
+            variant: '$brandSupplyEstimates.variants.name',
+            size: '$brandSupplyEstimates.variants.sizes.name',
+            distributorId: '$distributorId',
+            distributorName: '$distributor'
+          },
+          totalStock: { $sum: '$brandSupplyEstimates.variants.sizes.openingStock' },
+          averageRate: { $avg: '$brandSupplyEstimates.variants.sizes.proposedMarketRate' },
+          lastUpdated: { $max: '$createdAt' },
+          activities: { $addToSet: '$_id' }
+        }
+      }
+    ]);
+
+    // Second, get shop order requirements from RetailerShopActivity with shop details
+    const shopOrders = await RetailerShopActivity.aggregate([
+      { $match: matchQuery },
+      { $unwind: '$salesOrders' },
+      // Lookup shop details
+      {
+        $lookup: {
+          from: 'shops',
+          localField: 'shopId',
+          foreignField: '_id',
+          as: 'shopDetails'
+        }
+      },
+      { $unwind: '$shopDetails' },
+      // First group by shop and product to get unique shop orders
+      {
+        $group: {
+          _id: {
+            shopId: '$shopId',
+            shopName: { $first: '$shopDetails.name' },
+            brandName: '$salesOrders.brandName',
+            variant: '$salesOrders.variant',
+            size: '$salesOrders.size',
+            distributorId: '$distributorId'
+          },
+          quantity: { $sum: '$salesOrders.quantity' },
+          orderValue: { $sum: '$salesOrders.totalValue' },
+          activityId: { $first: '$_id' },
+          orderDate: { $first: '$createdAt' }
+        }
+      },
+      // Then group by product to get total requirements with shop details
+      {
+        $group: {
+          _id: {
+            brandName: '$_id.brandName',
+            variant: '$_id.variant',
+            size: '$_id.size',
+            distributorId: '$_id.distributorId'
+          },
+          totalRequirement: { $sum: '$quantity' },
+          orderCount: { $sum: 1 },
+          totalValue: { $sum: '$orderValue' },
+          uniqueShops: { 
+            $addToSet: {
+              shopId: '$_id.shopId',
+              shopName: '$_id.shopName',
+              quantity: '$quantity',
+              orderDate: '$orderDate'
+            }
+          },
+          shopActivities: { $addToSet: '$activityId' },
+          latestOrderDate: { $max: '$orderDate' }
+        }
+      },
+      // Sort by latest order date
+      { $sort: { 'latestOrderDate': -1 } }
+    ]);
+
+    // Create comprehensive inventory analysis
+    const inventoryAnalysis = [];
+    const stockMap = new Map();
+    const orderMap = new Map();
+
+    // Create maps for easier lookup - normalize keys for case-insensitive matching
+    stockLevels.forEach(stock => {
+      const key = `${stock._id.brandName}-${stock._id.variant}-${stock._id.size}-${stock._id.distributorId}`
+        .toLowerCase()
+        .trim()
+        .replace(/\s+/g, ' ');
+      stockMap.set(key, stock);
+    });
+
+    shopOrders.forEach(order => {
+      const key = `${order._id.brandName}-${order._id.variant}-${order._id.size}-${order._id.distributorId}`
+        .toLowerCase()
+        .trim()
+        .replace(/\s+/g, ' ');
+      orderMap.set(key, order);
+    });
+
+    // Get all unique combinations from both stock and orders
+    const allKeys = new Set([...stockMap.keys(), ...orderMap.keys()]);
+    
+    console.log('Stock levels:', stockLevels.length);
+    console.log('Shop orders:', shopOrders.length);
+    console.log('Unique combinations:', allKeys.size);
+    
+    // Log sample keys for debugging
+    console.log('Sample stock keys:', Array.from(stockMap.keys()).slice(0, 3));
+    console.log('Sample order keys:', Array.from(orderMap.keys()).slice(0, 3));
+    
+    // Get distributor details for name resolution
+    const Distributor = require('../models/Distributor');
+    const distributorCache = new Map();
+
+    for (const key of allKeys) {
+      const [brandName, variant, size, distributorId] = key.split('-');
+      const stockData = stockMap.get(key);
+      const orderData = orderMap.get(key);
+
+      // Get distributor name
+      let distributorName = 'Unknown';
+      if (distributorId && distributorId !== 'undefined') {
+        if (!distributorCache.has(distributorId)) {
+          try {
+            const distributor = await Distributor.findById(distributorId);
+            distributorCache.set(distributorId, distributor?.name || 'Unknown');
+          } catch (err) {
+            distributorCache.set(distributorId, 'Unknown');
+          }
+        }
+        distributorName = distributorCache.get(distributorId);
+      }
+
+      // Use distributor name from stock data if available
+      if (stockData && stockData._id.distributorName) {
+        distributorName = stockData._id.distributorName;
+      }
+
+      const currentStock = stockData?.totalStock || 0;
+      const totalRequirement = orderData?.totalRequirement || 0;
+      const stockDifference = currentStock - totalRequirement;
+      
+      console.log('Processing:', { brandName, variant, size, distributorId, currentStock, totalRequirement, stockDifference });
+
+      // Calculate stock status with buffer (10% of total requirement as buffer)
+      const buffer = totalRequirement * 0.1;
+      const statusThreshold = totalRequirement + buffer;
+      
+      // Enhanced stock status calculation
+      let stockStatus, statusColor;
+      if (currentStock >= statusThreshold) {
+        stockStatus = 'Sufficient';
+        statusColor = 'success';
+      } else if (currentStock >= totalRequirement) {
+        stockStatus = 'Adequate';
+        statusColor = 'info';
+      } else if (currentStock > totalRequirement * 0.5) {
+        stockStatus = 'Low';
+        statusColor = 'warning';
+      } else {
+        stockStatus = 'Critical';
+        statusColor = 'error';
+      }
+
+      const analysis = {
+        distributorId: distributorId === 'undefined' ? null : distributorId,
+        distributorName: distributorName || 'Unknown Distributor',
+        brandName: brandName || 'Unknown Brand',
+        variant: variant || 'Standard',
+        size: size || 'N/A',
+        currentStock,
+        proposedRate: stockData?.averageRate || 0,
+        totalRequirement,
+        stockDifference,
+        orderCount: orderData?.orderCount || 0,
+        uniqueShops: orderData?.uniqueShops || [],
+        uniqueShopsCount: orderData?.uniqueShops?.length || 0,
+        totalOrderValue: orderData?.totalValue || 0,
+        lastStockUpdate: stockData?.lastUpdated || null,
+        latestOrderDate: orderData?.latestOrderDate || null,
+        stockStatus,
+        statusColor,
+        stockPercentage: totalRequirement > 0 
+          ? Math.min(100, Math.round((currentStock / totalRequirement) * 100))
+          : currentStock > 0 ? 100 : 0,
+        activities: {
+          stockActivities: stockData?.activities?.length || 0,
+          orderActivities: orderData?.shopActivities?.length || 0,
+          lastActivityDate: orderData?.latestOrderDate || stockData?.lastUpdated || new Date()
+        }
+      };
+
+      inventoryAnalysis.push(analysis);
+    }
+
+    // Sort by stock difference (shortages first, then by severity)
+    inventoryAnalysis.sort((a, b) => {
+      if (a.stockDifference < 0 && b.stockDifference >= 0) return -1;
+      if (a.stockDifference >= 0 && b.stockDifference < 0) return 1;
+      if (a.stockDifference < 0 && b.stockDifference < 0) {
+        return a.stockDifference - b.stockDifference; // More negative first
+      }
+      return b.stockDifference - a.stockDifference; // Higher positive first
+    });
+
+    // Calculate summary statistics
+    const totalProducts = inventoryAnalysis.length;
+    const shortageProducts = inventoryAnalysis.filter(item => item.stockDifference < 0);
+    const sufficientProducts = inventoryAnalysis.filter(item => item.stockDifference > 0);
+    const balancedProducts = inventoryAnalysis.filter(item => item.stockDifference === 0);
+
+    const totalShortageQuantity = shortageProducts.reduce((sum, item) => sum + Math.abs(item.stockDifference), 0);
+    const totalSurplusQuantity = sufficientProducts.reduce((sum, item) => sum + item.stockDifference, 0);
+
+    // Group by distributor for distributor-wise summary
+    const distributorSummary = inventoryAnalysis.reduce((acc, item) => {
+      const distKey = item.distributorId || 'unknown';
+      if (!acc[distKey]) {
+        acc[distKey] = {
+          distributorId: item.distributorId,
+          distributorName: item.distributorName,
+          totalProducts: 0,
+          shortageCount: 0,
+          sufficientCount: 0,
+          balancedCount: 0,
+          totalShortage: 0,
+          totalSurplus: 0
+        };
+      }
+      
+      acc[distKey].totalProducts++;
+      if (item.stockDifference < 0) {
+        acc[distKey].shortageCount++;
+        acc[distKey].totalShortage += Math.abs(item.stockDifference);
+      } else if (item.stockDifference > 0) {
+        acc[distKey].sufficientCount++;
+        acc[distKey].totalSurplus += item.stockDifference;
+      } else {
+        acc[distKey].balancedCount++;
+      }
+      
+      return acc;
+    }, {});
+
+    res.status(200).json({
+      success: true,
+      data: {
+        inventoryAnalysis,
+        summary: {
+          totalProducts,
+          shortageProducts: shortageProducts.length,
+          sufficientProducts: sufficientProducts.length,
+          balancedProducts: balancedProducts.length,
+          totalShortageQuantity,
+          totalSurplusQuantity,
+          criticalShortages: shortageProducts.filter(item => item.stockPercentage < 25).length,
+          averageStockPercentage: totalProducts > 0 
+            ? Math.round(inventoryAnalysis.reduce((sum, item) => sum + item.stockPercentage, 0) / totalProducts)
+            : 100
+        },
+        distributorSummary: Object.values(distributorSummary),
+        timeRange: timeRange || 'last30days',
+        generatedAt: new Date()
+      }
+    });
+  } catch (error) {
+    console.error('Error getting inventory analysis:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error getting inventory analysis',
+      error: error.message 
+    });
+  }
+};
+
+/**
+ * Helper function to get monthly trend data for brands
+ */
+const getMonthlyTrendDataForBrands = async (matchQuery, brandName, variant) => {
+  const currentDate = new Date();
+  const months = [];
+  
+  // Get last 6 months
+  for (let i = 5; i >= 0; i--) {
+    const date = new Date(currentDate.getFullYear(), currentDate.getMonth() - i, 1);
+    months.push({
+      name: date.toLocaleString('default', { month: 'short', year: 'numeric' }),
+      start: new Date(date.getFullYear(), date.getMonth(), 1),
+      end: new Date(date.getFullYear(), date.getMonth() + 1, 0)
+    });
+  }
+
+  const trendData = await Promise.all(
+    months.map(async (month) => {
+      const monthQuery = {
+        ...matchQuery,
+        createdAt: { $gte: month.start, $lte: month.end }
+      };
+
+      const result = await RetailerShopActivity.aggregate([
+        { $match: monthQuery },
+        { $unwind: '$salesOrders' },
+        {
+          $match: {
+            ...(brandName && { 'salesOrders.brandName': brandName }),
+            ...(variant && { 'salesOrders.variant': variant })
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            orders: { $sum: 1 },
+            quantity: { $sum: '$salesOrders.quantity' },
+            value: { $sum: '$salesOrders.totalValue' }
+          }
+        }
+      ]);
+
+      return {
+        month: month.name,
+        orders: result[0]?.orders || 0,
+        quantity: result[0]?.quantity || 0,
+        value: result[0]?.value || 0
+      };
+    })
+  );
+
+  return trendData;
+};

@@ -1,0 +1,1124 @@
+const { validationResult } = require('express-validator');
+const MarketingStaffActivity = require('../models/MarketingStaffActivity');
+const RetailerShopActivity = require('../models/RetailerShopActivity');
+const User = require('../models/User');
+const Distributor = require('../models/Distributor');
+const logger = require('../utils/logger');
+const path = require('path');
+const fs = require('fs');
+const mongoose = require('mongoose');
+const StaffDistributorAssignment = require('../models/StaffDistributorAssignment');
+const Shop = require('../models/Shop'); // Added missing import for Shop
+
+/**
+ * @desc    Create a marketing staff activity with punch-in
+ * @route   POST /api/mobile/marketing-activity/punch-in
+ * @access  Private (Marketing Staff)
+ */
+exports.punchIn = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        errors: errors.array()
+      });
+    }
+
+    const {
+      distributorId,
+      retailShop,
+      distributor,
+      areaName,
+      tripCompanion,
+      modeOfTransport,
+      selfieImage,
+      shopTypes,
+      shops,
+      brandSupplyEstimates
+    } = req.body;
+
+    // Check if already punched in
+    const existingActivity = await MarketingStaffActivity.findOne({
+      marketingStaffId: req.user.id,
+      status: 'Punched In',
+      meetingEndTime: null
+    });
+
+    if (existingActivity) {
+      return res.status(400).json({
+        success: false,
+        error: 'You are already punched in. Please punch out first.'
+      });
+    }
+
+    // Validate distributor
+    const distributorExists = await Distributor.findById(distributorId);
+    if (!distributorExists) {
+      return res.status(404).json({
+        success: false,
+        error: 'Distributor not found'
+      });
+    }
+
+    // Process and validate shops
+    let processedShops = [];
+    if (shops && Array.isArray(shops)) {
+      for (const shopData of shops) {
+        try {
+          // Check if shop already exists by name and distributor
+          let existingShop = await Shop.findOne({
+            name: shopData.name,
+            distributorId: distributorId,
+            isActive: true
+          });
+
+          if (!existingShop) {
+            // Create new shop document
+            // Instead of creating a new shop, just use the shop data from the request
+            // This will allow the app to reference the shop without creating a database entry
+            existingShop = {
+              _id: new mongoose.Types.ObjectId(), // Generate a temporary ID
+              name: shopData.name,
+              ownerName: shopData.ownerName || 'Unknown Owner',
+              address: shopData.address || 'Unknown Address',
+              type: shopData.type || 'Retailer',
+              distributorId: distributorId,
+              isTemporary: true,
+              isActive: true
+            };
+            
+            logger.info(`Using temporary shop reference: ${shopData.name} with ID: ${existingShop._id}`);            
+            logger.info(`Created new shop: ${shopData.name} with ID: ${existingShop._id}`);
+          } else {
+            logger.info(`Found existing shop: ${shopData.name} with ID: ${existingShop._id}`);
+          }
+
+          // Add to processed shops with proper shop ID and data
+          processedShops.push({
+            shopId: existingShop._id, // This is the REAL shop ID
+            name: existingShop.name,
+            type: existingShop.type,
+            ownerName: existingShop.ownerName,
+            address: existingShop.address,
+            _id: existingShop._id // Keep _id for backward compatibility
+          });
+        } catch (error) {
+          logger.error(`Error processing shop ${shopData.name}: ${error.message}`);
+          // Continue with next shop instead of failing the whole punch-in
+          continue;
+        }
+      }
+    }
+
+
+    // Process and clean up brandSupplyEstimates
+    let processedBrandEstimates = [];
+    if (brandSupplyEstimates && Array.isArray(brandSupplyEstimates)) {
+      processedBrandEstimates = brandSupplyEstimates.map(brand => {
+        const brandData = {
+          name: brand.name,
+          variants: []
+        };
+        
+        if (brand.variants && Array.isArray(brand.variants)) {
+          brandData.variants = brand.variants.map(variant => {
+            const variantData = {
+              name: variant.name || 'Unnamed Variant',
+              sizes: []
+            };
+            
+            if (variant.sizes && Array.isArray(variant.sizes)) {
+              variantData.sizes = variant.sizes.map(size => ({
+                name: size.name || 'Unnamed Size',
+                openingStock: size.openingStock || 0,
+                proposedMarketRate: size.proposedMarketRate || 0
+              }));
+            }
+            
+            return variantData;
+          });
+        }
+        
+        return brandData;
+      });
+    }
+    // Create marketing activity
+    const activity = await MarketingStaffActivity.create({
+      marketingStaffId: req.user.id,
+      distributorId,
+      retailShop,
+      distributor,
+      areaName,
+      tripCompanion,
+      modeOfTransport,
+      selfieImage,
+      shopTypes,
+      shops: processedShops, // Use processed shops with real Shop document IDs
+      brandSupplyEstimates: processedBrandEstimates,
+      meetingStartTime: new Date(),
+      status: 'Punched In',
+      isVisibleToStaff: true
+    });
+
+    // Return success response
+    res.status(201).json({
+      success: true,
+      data: activity
+    });
+  } catch (error) {
+    logger.error(`Error in punchIn controller: ${error.message}`);
+    next(error);
+  }
+};
+
+/**
+ * @desc    Punch out - update existing activity
+ * @route   PATCH /api/mobile/marketing-activity/punch-out 
+ * @access  Private (Marketing Staff)
+ */
+exports.punchOut = async (req, res, next) => {
+  try {
+    const { distributorId } = req.body;
+
+    // Find active marketing activity
+    const activity = await MarketingStaffActivity.findOne({
+        marketingStaffId: req.user.id,
+      distributorId,
+        status: 'Punched In',
+        meetingEndTime: null
+      });
+      
+    if (!activity) {
+      return res.status(404).json({
+        success: false,
+        error: 'No active punch-in found'
+      });
+    }
+
+    // Get all shop activities for this marketing session
+    const shopActivities = await RetailerShopActivity.find({
+      marketingStaffId: req.user.id,
+      distributorId,
+      createdAt: {
+        $gte: activity.meetingStartTime,
+        $lte: new Date()
+      }
+    }).populate('shopId', 'name ownerName address type');
+
+    let totalSalesOrders = 0;
+    let totalSalesValue = 0;
+    let totalShopsVisited = 0;
+    let retailerShopActivities = [];
+
+    // Process shop activities
+    shopActivities.forEach(shopActivity => {
+      if (shopActivity.salesOrders && Array.isArray(shopActivity.salesOrders)) {
+        totalSalesOrders += shopActivity.salesOrders.length;
+        shopActivity.salesOrders.forEach(order => {
+          if (order.quantity && order.rate) {
+            totalSalesValue += order.quantity * order.rate;
+          }
+        });
+      }
+      
+      // Add shop activity details with proper shop information
+      if (shopActivity.shopId) {
+        const shop = shopActivity.shopId;
+        retailerShopActivities.push({
+          shopId: shop._id,
+          shopName: shop.name,
+          shopOwner: shop.ownerName,
+          shopAddress: shop.address,
+          shopType: shop.type,
+          salesOrders: shopActivity.salesOrders || [],
+          complaint: shopActivity.complaint,
+          marketInsight: shopActivity.marketInsight,
+          visitObjective: shopActivity.visitObjective,
+          visitOutcome: shopActivity.visitOutcome,
+          status: shopActivity.status,
+          punchInTime: shopActivity.punchInTime,
+          punchOutTime: shopActivity.punchOutTime,
+          photos: shopActivity.photos || [],
+          voiceNote: shopActivity.voiceNote,
+          alternateProviders: shopActivity.alternateProviders || []
+        });
+        totalShopsVisited++;
+      }
+    });
+
+    // Update activity with punch out data
+    activity.meetingEndTime = new Date();
+    activity.status = 'Punched Out';
+    activity.durationMinutes = Math.round(
+      (activity.meetingEndTime - activity.meetingStartTime) / (1000 * 60)
+    );
+    activity.retailerShopActivities = retailerShopActivities;
+    activity.totalSalesOrders = totalSalesOrders;
+    activity.totalSalesValue = totalSalesValue;
+    activity.totalShopsVisited = totalShopsVisited;
+    activity.shopsVisitedCount = activity.shops ? activity.shops.length : 0;
+
+    await activity.save();
+
+    // Return updated activity
+    res.json({
+      success: true,
+      data: activity
+    });
+  } catch (error) {
+    logger.error(`Error in punchOut controller: ${error.message}`);
+    next(error);
+  }
+};
+
+/**
+ * @desc    Get all marketing staff activities (Admin only)
+ * @route   GET /api/marketing-activity
+ * @access  Private (Admin)
+ */
+exports.getMarketingActivities = async (req, res, next) => {
+  try {
+    const { staffId, distributorId, fromDate, toDate, status, page = 1, limit = 10 } = req.query;
+    
+    // Build query
+    let query = {};
+    
+    if (staffId) {
+      query.marketingStaffId = staffId;
+    }
+    
+    if (distributorId) {
+      query.distributorId = distributorId;
+    }
+    
+    if (fromDate || toDate) {
+      query.createdAt = {};
+      
+      if (fromDate) {
+        const startDate = new Date(fromDate);
+        startDate.setHours(0, 0, 0, 0);
+        query.createdAt.$gte = startDate;
+      }
+      
+      if (toDate) {
+        const endDate = new Date(toDate);
+        endDate.setHours(23, 59, 59, 999);
+        query.createdAt.$lte = endDate;
+      }
+    }
+    
+    if (status) {
+      query.status = status;
+    }
+    
+    // Parse pagination parameters
+    const pageNum = parseInt(page, 10);
+    const limitNum = parseInt(limit, 10);
+    const skip = (pageNum - 1) * limitNum;
+    
+    logger.info(`Admin fetching marketing activities with query: ${JSON.stringify(query)}`);
+    
+    // Get total count for pagination
+    const totalCount = await MarketingStaffActivity.countDocuments(query);
+    
+    // Get activities with pagination
+    const activities = await MarketingStaffActivity.find(query)
+      .populate('marketingStaffId', 'name email role')
+      .populate('distributorId', 'name shopName address contact')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limitNum);
+
+    logger.info(`Admin found ${activities.length} marketing activities`);
+    
+    // Calculate additional metrics for each activity and fetch related retailer shop activities
+    const enhancedActivities = await Promise.all(activities.map(async (activity) => {
+      const activityObj = activity.toObject();
+      
+      // Calculate duration if activity has both start and end times
+      if (activityObj.meetingStartTime && activityObj.meetingEndTime) {
+        const durationMs = new Date(activityObj.meetingEndTime) - new Date(activityObj.meetingStartTime);
+        const durationMinutes = Math.floor(durationMs / 60000);
+        activityObj.durationMinutes = durationMinutes;
+      }
+      
+      // Count shops visited
+      if (activityObj.shops && activityObj.shops.length > 0) {
+        activityObj.shopsVisitedCount = activityObj.shops.length;
+      }
+      
+      // Fetch related retailer shop activities for this marketing activity
+      try {
+        const retailerActivities = await RetailerShopActivity.find({
+          marketingStaffId: activityObj.marketingStaffId._id || activityObj.marketingStaffId,
+          distributorId: activityObj.distributorId._id || activityObj.distributorId,
+          createdAt: {
+            $gte: new Date(activityObj.meetingStartTime || activityObj.createdAt),
+            $lte: new Date(activityObj.meetingEndTime || new Date())
+          }
+        }).populate('shopId', 'name ownerName address type');
+        
+        activityObj.retailerShopActivities = retailerActivities;
+        activityObj.totalShopsVisited = retailerActivities.length;
+        
+        // Calculate total sales orders
+        let totalSalesOrders = 0;
+        let totalSalesValue = 0;
+        retailerActivities.forEach(shopActivity => {
+          if (shopActivity.salesOrders && shopActivity.salesOrders.length > 0) {
+            totalSalesOrders += shopActivity.salesOrders.length;
+            shopActivity.salesOrders.forEach(order => {
+              totalSalesValue += (order.quantity * (order.rate || 0));
+            });
+          }
+        });
+        
+        activityObj.totalSalesOrders = totalSalesOrders;
+        activityObj.totalSalesValue = totalSalesValue;
+        
+      } catch (error) {
+        logger.error(`Error fetching retailer shop activities for marketing activity ${activityObj._id}: ${error.message}`);
+        activityObj.retailerShopActivities = [];
+        activityObj.totalShopsVisited = 0;
+        activityObj.totalSalesOrders = 0;
+        activityObj.totalSalesValue = 0;
+      }
+      
+      return activityObj;
+    }));
+    
+    // Prepare pagination info
+    const totalPages = Math.ceil(totalCount / limitNum);
+    const hasNextPage = pageNum < totalPages;
+    const hasPrevPage = pageNum > 1;
+
+    res.status(200).json({
+      success: true,
+      count: totalCount,
+      data: enhancedActivities,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        totalPages,
+        totalItems: totalCount,
+        hasNextPage,
+        hasPrevPage
+      }
+    });
+  } catch (error) {
+    logger.error(`Error in getMarketingActivities controller: ${error.message}`);
+    next(error);
+  }
+};
+
+/**
+ * @desc    Get marketing staff activity by ID
+ * @route   GET /api/marketing-activity/:id
+ * @access  Private (Admin)
+ */
+exports.getMarketingActivity = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    
+    // Validate activity ID
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid activity ID format: ${id}`
+      });
+    }
+    
+    logger.info(`Fetching marketing activity by ID: ${id}`);
+    
+    // Get the marketing activity
+    const activity = await MarketingStaffActivity.findById(id)
+      .populate('marketingStaffId', 'name email role')
+      .populate('distributorId', 'name shopName address contact');
+
+    if (!activity) {
+      return res.status(404).json({
+        success: false,
+        error: 'Activity not found'
+      });
+    }
+
+    const activityObj = activity.toObject();
+    
+    // Calculate duration if activity has both start and end times
+    if (activityObj.meetingStartTime && activityObj.meetingEndTime) {
+      const durationMs = new Date(activityObj.meetingEndTime) - new Date(activityObj.meetingStartTime);
+      const durationMinutes = Math.floor(durationMs / 60000);
+      activityObj.durationMinutes = durationMinutes;
+    }
+    
+    // Count shops visited
+    if (activityObj.shops && activityObj.shops.length > 0) {
+      activityObj.shopsVisitedCount = activityObj.shops.length;
+    }
+    
+    // Fetch related retailer shop activities for this marketing activity
+    try {
+      const retailerActivities = await RetailerShopActivity.find({
+        marketingStaffId: activityObj.marketingStaffId._id || activityObj.marketingStaffId,
+        distributorId: activityObj.distributorId._id || activityObj.distributorId,
+        createdAt: {
+          $gte: new Date(activityObj.meetingStartTime || activityObj.createdAt),
+          $lte: new Date(activityObj.meetingEndTime || new Date())
+        }
+      }).populate('shopId', 'name ownerName address type');
+      
+      activityObj.retailerShopActivities = retailerActivities;
+      activityObj.totalShopsVisited = retailerActivities.length;
+      
+      // Calculate total sales orders
+      let totalSalesOrders = 0;
+      let totalSalesValue = 0;
+      retailerActivities.forEach(shopActivity => {
+        if (shopActivity.salesOrders && shopActivity.salesOrders.length > 0) {
+          totalSalesOrders += shopActivity.salesOrders.length;
+          shopActivity.salesOrders.forEach(order => {
+            totalSalesValue += (order.quantity * (order.rate || 0));
+          });
+        }
+      });
+      
+      activityObj.totalSalesOrders = totalSalesOrders;
+      activityObj.totalSalesValue = totalSalesValue;
+      
+    } catch (error) {
+      logger.error(`Error fetching retailer shop activities for marketing activity ${activityObj._id}: ${error.message}`);
+      activityObj.retailerShopActivities = [];
+      activityObj.totalShopsVisited = 0;
+      activityObj.totalSalesOrders = 0;
+      activityObj.totalSalesValue = 0;
+    }
+    
+    logger.info(`Successfully fetched marketing activity ${id}`);
+
+    res.status(200).json({
+      success: true,
+      data: activityObj
+    });
+  } catch (error) {
+    logger.error(`Error in getMarketingActivity controller: ${error.message}`);
+    next(error);
+  }
+};
+
+/**
+ * @desc    Get marketing staff activities for the logged-in staff (with 48-hour limit)
+ * @route   GET /api/mobile/marketing-activity/my-activities
+ * @access  Private (Marketing Staff)
+ */
+exports.getMyActivities = async (req, res, next) => {
+  try {
+    const { distributorId, date, status } = req.query;
+    
+    // Build query - always filter by the current staff ID
+    let query = { marketingStaffId: req.user.id };
+    
+    // If distributorId is provided, filter by it
+    if (distributorId) {
+      // Make sure we're using a valid ObjectId
+      try {
+        const validDistributorId = new mongoose.Types.ObjectId(distributorId);
+        query.distributorId = validDistributorId;
+        logger.info(`Filtering activities by distributorId: ${distributorId}`);
+      } catch (err) {
+        logger.error(`Invalid distributorId format: ${distributorId}`);
+        return res.status(400).json({
+          success: false,
+          error: `Invalid distributorId format: ${distributorId}`
+        });
+      }
+    }
+    
+    // Filter by date if provided
+    if (date) {
+      const queryDate = new Date(date);
+      const startOfDay = new Date(queryDate.setHours(0, 0, 0, 0));
+      const endOfDay = new Date(queryDate.setHours(23, 59, 59, 999));
+      
+      query.createdAt = { $gte: startOfDay, $lte: endOfDay };
+    }
+    
+    // Filter by status if provided
+    if (status) {
+      query.status = status;
+    }
+    
+    // Get activities with time limit applied (only show activities within 48 hours for staff)
+    const fortyEightHoursAgo = new Date();
+    fortyEightHoursAgo.setHours(fortyEightHoursAgo.getHours() - 48);
+    query.createdAt = { ...query.createdAt, $gte: fortyEightHoursAgo };
+    
+    logger.info(`Fetching activities with query: ${JSON.stringify(query)}`);
+    
+    const activities = await MarketingStaffActivity.find(query)
+      .populate('marketingStaffId', 'name email role')
+      .populate('distributorId', 'name shopName address')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Enhanced activities with detailed shop visit data
+    const enhancedActivities = await Promise.all(activities.map(async (activity) => {
+      const activityObj = activity;
+      
+      // Add additional fields for the mobile app
+      if (activityObj.shops && Array.isArray(activityObj.shops)) {
+        activityObj.shopsVisitedCount = activityObj.shops.length;
+        
+        // Process shops to ensure they have proper data
+        activityObj.shops = activityObj.shops.map(shop => {
+          // If shop has shopId, try to populate it
+          if (shop.shopId && mongoose.Types.ObjectId.isValid(shop.shopId)) {
+            return {
+              ...shop,
+              shopId: shop.shopId,
+              name: shop.name || 'Unknown Shop',
+              type: shop.type || 'Retailer',
+              ownerName: shop.ownerName || 'Unknown Owner',
+              address: shop.address || 'Unknown Address'
+            };
+          } else {
+            // Fallback for shops without proper IDs
+            return {
+              ...shop,
+              shopId: shop._id || new mongoose.Types.ObjectId(),
+              name: shop.name || 'Unknown Shop',
+              type: shop.type || 'Retailer',
+              ownerName: shop.ownerName || 'Unknown Owner',
+              address: shop.address || 'Unknown Address'
+            };
+          }
+        });
+      }
+      
+      // Fetch related retailer shop activities for this marketing activity
+      try {
+        // Get the time range for this activity
+        const startTime = activityObj.meetingStartTime || activityObj.createdAt;
+        const endTime = activityObj.meetingEndTime || new Date();
+        
+        // Fetch all retailer shop activities for this marketing staff and distributor within the time range
+        const retailerActivities = await RetailerShopActivity.find({
+          marketingStaffId: activityObj.marketingStaffId._id || activityObj.marketingStaffId,
+          distributorId: activityObj.distributorId._id || activityObj.distributorId,
+          createdAt: {
+            $gte: new Date(startTime),
+            $lte: new Date(endTime)
+          }
+        }).populate({
+          path: 'shopId',
+          select: 'name ownerName address type contact',
+          model: 'Shop'
+        });
+        
+        // Organize shop visit data with proper shop details
+        const shopVisits = retailerActivities.map(shopActivity => {
+          // Get shop details from populated field or fallback
+          const shop = shopActivity.shopId;
+          
+          const shopVisit = {
+            shopId: shop?._id || shopActivity.shopId || new mongoose.Types.ObjectId(),
+            shopName: shop?.name || 'Unknown Shop',
+            shopOwner: shop?.ownerName || 'N/A',
+            shopAddress: shop?.address || 'N/A',
+            shopType: shop?.type || 'N/A',
+            shopContact: shop?.contact || 'N/A',
+            visitTime: shopActivity.createdAt,
+            status: shopActivity.status || 'N/A',
+            mobileNumber: shopActivity.mobileNumber || 'N/A',
+            
+            // Sales Orders
+            salesOrders: shopActivity.salesOrders?.map(order => ({
+              brandName: order.brandName || order.brand || 'Unknown Brand',
+              variant: order.variant || 'N/A',
+              size: order.size || 'N/A',
+              quantity: order.quantity || 0,
+              rate: order.rate || 0,
+              totalValue: (order.quantity || 0) * (order.rate || 0),
+              isDisplayedInCounter: order.isDisplayedInCounter || false,
+              orderType: order.orderType || 'Fresh Order'
+            })) || [],
+            
+            // Alternate Providers
+            alternateProviders: shopActivity.alternateProviders?.map(provider => ({
+              brandName: provider.brandName || 'N/A',
+              providerName: provider.providerName || 'N/A',
+              rate: provider.rate || 0
+            })) || [],
+            
+            // Market Inquiries
+            marketInquiries: shopActivity.marketInquiries?.map(inquiry => ({
+              brandName: inquiry.brandName || 'N/A',
+              variant: inquiry.variant || 'N/A',
+              size: inquiry.size || 'N/A',
+              quantity: inquiry.quantity || 0,
+              reason: inquiry.reason || 'N/A'
+            })) || [],
+            
+            // Other data
+            complaint: shopActivity.complaint || '',
+            complaintCategory: shopActivity.complaintCategory || '',
+            complaintSeverity: shopActivity.complaintSeverity || 'Medium',
+            marketInsight: shopActivity.marketInsight || '',
+            competitorActivity: shopActivity.competitorActivity || '',
+            salesPotential: shopActivity.salesPotential || 'Medium',
+            voiceNote: shopActivity.voiceNote || '',
+            photos: shopActivity.photos || []
+          };
+          
+          return shopVisit;
+        });
+        
+        // Add shop visits to the activity
+        activityObj.shopVisits = shopVisits;
+        activityObj.shopVisitsCount = shopVisits.length;
+        
+      } catch (err) {
+        logger.error(`Error fetching retailer shop activities: ${err.message}`);
+        activityObj.shopVisits = [];
+        activityObj.shopVisitsCount = 0;
+      }
+      
+      return activityObj;
+    }));
+    
+    res.status(200).json({
+      success: true,
+      count: enhancedActivities.length,
+      data: enhancedActivities
+    });
+  } catch (error) {
+    logger.error(`Error in getMyActivities controller: ${error.message}`);
+    next(error);
+  }
+};
+
+/**
+ * @desc    Get all marketing staff activities for managers (with 7-day limit)
+ * @route   GET /api/mobile/marketing-activity/all-staff-activities
+ * @access  Private (Mid-Level Manager, Admin)
+ */
+exports.getAllStaffActivities = async (req, res, next) => {
+  try {
+    const { distributorId, staffId, date, status, page = 1, limit = 20 } = req.query;
+    
+    // Check if user has manager or admin role
+    if (req.user.role !== 'Mid-Level Manager' && req.user.role !== 'Admin') {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied. Only managers and admins can view all staff activities'
+      });
+    }
+    
+    // Build query
+    let query = {};
+    
+    // Filter by distributorId if provided
+    if (distributorId) {
+      try {
+        const validDistributorId = new mongoose.Types.ObjectId(distributorId);
+        query.distributorId = validDistributorId;
+      } catch (err) {
+        logger.error(`Invalid distributorId format: ${distributorId}`);
+        return res.status(400).json({
+          success: false,
+          error: `Invalid distributorId format: ${distributorId}`
+        });
+      }
+    }
+    
+    // Filter by staffId if provided
+    if (staffId) {
+      try {
+        const validStaffId = new mongoose.Types.ObjectId(staffId);
+        query.marketingStaffId = validStaffId;
+      } catch (err) {
+        logger.error(`Invalid staffId format: ${staffId}`);
+        return res.status(400).json({
+          success: false,
+          error: `Invalid staffId format: ${staffId}`
+        });
+      }
+    }
+    
+    // Filter by date if provided
+    if (date) {
+      const queryDate = new Date(date);
+      const startOfDay = new Date(queryDate.setHours(0, 0, 0, 0));
+      const endOfDay = new Date(queryDate.setHours(23, 59, 59, 999));
+      
+      query.createdAt = { $gte: startOfDay, $lte: endOfDay };
+    }
+    
+    // Filter by status if provided
+    if (status) {
+      query.status = status;
+    }
+    
+    // Get activities with time limit applied (only show activities within 7 days for managers)
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    query.createdAt = { ...query.createdAt, $gte: sevenDaysAgo };
+    
+    logger.info(`Manager ${req.user.id} fetching all staff activities with query: ${JSON.stringify(query)}`);
+    
+    // Parse pagination parameters
+    const pageNum = parseInt(page, 10);
+    const limitNum = parseInt(limit, 10);
+    const skip = (pageNum - 1) * limitNum;
+    
+    // Get total count for pagination
+    const totalCount = await MarketingStaffActivity.countDocuments(query);
+    
+    // Get activities with pagination
+    const activities = await MarketingStaffActivity.find(query)
+      .populate('marketingStaffId', 'name email role')
+      .populate('distributorId', 'name shopName address')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limitNum)
+      .lean();
+    
+    // Enhanced activities with detailed shop visit data
+    const enhancedActivities = await Promise.all(activities.map(async (activity) => {
+      const activityObj = activity;
+      
+      // Add additional fields for the mobile app
+      if (activityObj.shops && Array.isArray(activityObj.shops)) {
+        activityObj.shopsVisitedCount = activityObj.shops.length;
+        
+        // Process shops to ensure they have proper data
+        activityObj.shops = activityObj.shops.map(shop => {
+          // If shop has shopId, try to populate it
+          if (shop.shopId && mongoose.Types.ObjectId.isValid(shop.shopId)) {
+            return {
+              ...shop,
+              shopId: shop.shopId,
+              name: shop.name || 'Unknown Shop',
+              type: shop.type || 'Retailer',
+              ownerName: shop.ownerName || 'Unknown Owner',
+              address: shop.address || 'Unknown Address'
+            };
+          } else {
+            // Fallback for shops without proper IDs
+            return {
+              ...shop,
+              shopId: shop._id || new mongoose.Types.ObjectId(),
+              name: shop.name || 'Unknown Shop',
+              type: shop.type || 'Retailer',
+              ownerName: shop.ownerName || 'Unknown Owner',
+              address: shop.address || 'Unknown Address'
+            };
+          }
+        });
+      }
+      
+      // Fetch related retailer shop activities for this marketing activity
+      try {
+        // Get the time range for this activity
+        const startTime = activityObj.meetingStartTime || activityObj.createdAt;
+        const endTime = activityObj.meetingEndTime || new Date();
+        
+        // Fetch all retailer shop activities for this marketing staff and distributor within the time range
+        const retailerActivities = await RetailerShopActivity.find({
+          marketingStaffId: activityObj.marketingStaffId._id || activityObj.marketingStaffId,
+          distributorId: activityObj.distributorId._id || activityObj.distributorId,
+          createdAt: {
+            $gte: new Date(startTime),
+            $lte: new Date(endTime)
+          }
+        }).populate({
+          path: 'shopId',
+          select: 'name ownerName address type contact',
+          model: 'Shop'
+        });
+        
+        // Organize shop visit data with proper shop details
+        const shopVisits = retailerActivities.map(shopActivity => {
+          // Get shop details from populated field or fallback
+          const shop = shopActivity.shopId;
+          
+          const shopVisit = {
+            shopId: shop?._id || shopActivity.shopId || new mongoose.Types.ObjectId(),
+            shopName: shop?.name || 'Unknown Shop',
+            shopOwner: shop?.ownerName || 'N/A',
+            shopAddress: shop?.address || 'N/A',
+            shopType: shop?.type || 'N/A',
+            shopContact: shop?.contact || 'N/A',
+            visitTime: shopActivity.createdAt,
+            status: shopActivity.status || 'N/A',
+            mobileNumber: shopActivity.mobileNumber || 'N/A',
+            
+            // Sales Orders
+            salesOrders: shopActivity.salesOrders?.map(order => ({
+              brandName: order.brandName || order.brand || 'Unknown Brand',
+              variant: order.variant || 'N/A',
+              size: order.size || 'N/A',
+              quantity: order.quantity || 0,
+              rate: order.rate || 0,
+              totalValue: (order.quantity || 0) * (order.rate || 0),
+              isDisplayedInCounter: order.isDisplayedInCounter || false,
+              orderType: order.orderType || 'Fresh Order'
+            })) || [],
+            
+            // Alternate Providers
+            alternateProviders: shopActivity.alternateProviders?.map(provider => ({
+              brandName: provider.brandName || 'N/A',
+              providerName: provider.providerName || 'N/A',
+              rate: provider.rate || 0
+            })) || [],
+            
+            // Market Inquiries
+            marketInquiries: shopActivity.marketInquiries?.map(inquiry => ({
+              brandName: inquiry.brandName || 'N/A',
+              variant: inquiry.variant || 'N/A',
+              size: inquiry.size || 'N/A',
+              quantity: inquiry.quantity || 0,
+              reason: inquiry.reason || 'N/A'
+            })) || [],
+            
+            // Other data
+            complaint: shopActivity.complaint || '',
+            complaintCategory: shopActivity.complaintCategory || '',
+            complaintSeverity: shopActivity.complaintSeverity || 'Medium',
+            marketInsight: shopActivity.marketInsight || '',
+            competitorActivity: shopActivity.competitorActivity || '',
+            salesPotential: shopActivity.salesPotential || 'Medium',
+            voiceNote: shopActivity.voiceNote || '',
+            photos: shopActivity.photos || []
+          };
+          
+          return shopVisit;
+        });
+        
+        // Add shop visits to the activity
+        activityObj.shopVisits = shopVisits;
+        activityObj.shopVisitsCount = shopVisits.length;
+        
+        // Calculate totals for this activity
+        activityObj.totalShopsVisited = shopVisits.length;
+        activityObj.totalSalesOrders = shopVisits.reduce((total, shop) => total + (shop.salesOrders?.length || 0), 0);
+        activityObj.totalSalesValue = shopVisits.reduce((total, shop) => {
+          return total + shop.salesOrders.reduce((orderTotal, order) => {
+            return orderTotal + ((order.quantity || 0) * (order.rate || 0));
+          }, 0);
+        }, 0);
+        
+      } catch (err) {
+        logger.error(`Error fetching retailer shop activities: ${err.message}`);
+        activityObj.shopVisits = [];
+        activityObj.shopVisitsCount = 0;
+        activityObj.totalShopsVisited = 0;
+        activityObj.totalSalesOrders = 0;
+        activityObj.totalSalesValue = 0;
+      }
+      
+      return activityObj;
+    }));
+    
+    // Prepare pagination info
+    const totalPages = Math.ceil(totalCount / limitNum);
+    const hasNextPage = pageNum < totalPages;
+    const hasPrevPage = pageNum > 1;
+
+    res.status(200).json({
+      success: true,
+      count: totalCount,
+      data: enhancedActivities,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        totalPages,
+        totalItems: totalCount,
+        hasNextPage,
+        hasPrevPage
+      }
+    });
+  } catch (error) {
+    logger.error(`Error in getAllStaffActivities controller: ${error.message}`);
+    next(error);
+  }
+};
+
+/**
+ * @desc    Get marketing staff activities by distributor ID
+ * @route   GET /api/marketing-activity/distributor/:distributorId
+ * @access  Private (Admin)
+ */
+exports.getActivitiesByDistributorId = async (req, res, next) => {
+  try {
+    const { distributorId } = req.params;
+    const { staffId, fromDate, toDate, status, page = 1, limit = 10 } = req.query;
+    
+    // Validate distributor ID
+    if (!mongoose.Types.ObjectId.isValid(distributorId)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid distributor ID format: ${distributorId}`
+      });
+    }
+    
+    // Build query with distributorId
+    let query = { distributorId };
+    
+    // Add optional filters
+    if (staffId) {
+      query.marketingStaffId = staffId;
+    }
+    
+    if (fromDate || toDate) {
+      query.createdAt = {};
+      
+      if (fromDate) {
+        const startDate = new Date(fromDate);
+        startDate.setHours(0, 0, 0, 0);
+        query.createdAt.$gte = startDate;
+      }
+      
+      if (toDate) {
+        const endDate = new Date(toDate);
+        endDate.setHours(23, 59, 59, 999);
+        query.createdAt.$lte = endDate;
+      }
+    }
+    
+    if (status) {
+      query.status = status;
+    }
+    
+    // Parse pagination parameters
+    const pageNum = parseInt(page, 10);
+    const limitNum = parseInt(limit, 10);
+    const skip = (pageNum - 1) * limitNum;
+    
+    logger.info(`Fetching activities for distributor ${distributorId} with query: ${JSON.stringify(query)}`);
+    
+    // Get total count for pagination
+    const totalCount = await MarketingStaffActivity.countDocuments(query);
+    
+    // Get activities with pagination
+    const activities = await MarketingStaffActivity.find(query)
+      .populate('marketingStaffId', 'name email role')
+      .populate('distributorId', 'name shopName address contact')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limitNum);
+    
+    logger.info(`Found ${activities.length} activities for distributor ${distributorId}`);
+    
+    // Calculate additional metrics for each activity
+    const enhancedActivities = activities.map(activity => {
+      const activityObj = activity.toObject();
+      
+      // Calculate duration if activity has both start and end times
+      if (activityObj.meetingStartTime && activityObj.meetingEndTime) {
+        const durationMs = new Date(activityObj.meetingEndTime) - new Date(activityObj.meetingStartTime);
+        const durationMinutes = Math.floor(durationMs / 60000);
+        activityObj.durationMinutes = durationMinutes;
+      }
+      
+      // Count shops visited
+      if (activityObj.shops && activityObj.shops.length > 0) {
+        activityObj.shopsVisitedCount = activityObj.shops.length;
+      }
+      
+      return activityObj;
+    });
+    
+    // Prepare pagination info
+    const totalPages = Math.ceil(totalCount / limitNum);
+    const hasNextPage = pageNum < totalPages;
+    const hasPrevPage = pageNum > 1;
+    
+    res.status(200).json({
+      success: true,
+      count: totalCount,
+      data: enhancedActivities,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        totalPages,
+        totalItems: totalCount,
+        hasNextPage,
+        hasPrevPage
+      }
+    });
+  } catch (error) {
+    logger.error(`Error in getActivitiesByDistributorId controller: ${error.message}`);
+    next(error);
+  }
+};
+
+/**
+ * @desc    Get assigned distributors for a marketing staff
+ * @route   GET /api/mobile/marketing-activity/assigned-distributors
+ * @access  Private (Marketing Staff)
+ */
+exports.getAssignedDistributors = async (req, res, next) => {
+  try {
+    const assignment = await StaffDistributorAssignment.findOne({
+      staffId: req.user.id,
+      isActive: true
+    }).populate('distributorIds', 'name shopName address contact retailShops wholesaleShops');
+
+    if (!assignment) {
+      return res.status(200).json({
+        success: true,
+        data: []
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: assignment.distributorIds
+    });
+  } catch (error) {
+    logger.error(`Error in getAssignedDistributors controller: ${error.message}`);
+    next(error);
+  }
+};
+
+/**
+ * @desc    Delete marketing staff activity (Admin only)
+ * @route   DELETE /api/marketing-activity/:id
+ * @access  Private (Admin)
+ */
+exports.deleteMarketingActivity = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    
+    // Validate activity ID
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid activity ID format: ${id}`
+      });
+    }
+    
+    // Find the activity
+    const activity = await MarketingStaffActivity.findById(id);
+    if (!activity) {
+      return res.status(404).json({
+        success: false,
+        error: 'Activity not found'
+      });
+    }
+    
+    logger.info(`Admin deleting marketing activity ${id}`);
+    
+    // Delete the activity
+    await MarketingStaffActivity.findByIdAndDelete(id);
+    
+    res.status(200).json({
+      success: true,
+      message: 'Activity deleted successfully'
+    });
+  } catch (error) {
+    logger.error(`Error in deleteMarketingActivity controller: ${error.message}`);
+    next(error);
+  }
+};

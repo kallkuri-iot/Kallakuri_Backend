@@ -1,0 +1,46 @@
+
+> backend-api@1.0.0 start
+> node src/server.js
+
+Configuration Loaded:
+PORT: 5050
+MONGO_URI: mongodb+srv://jhas69259:Namanjha%409934@cluster0.mqex9dg.mongodb.net/Kallakuri_New_Database?retryWrites=true&w=majority&appName=Cluster0
+JWT_SECRET: sdkfjhs234kj23h4k2jh34kjh2fdsjkfds87238472384sdjfh
+JWT_EXPIRATION: 604800
+NODE_ENV: development
+Connecting to MongoDB Atlas...
+Routes mounted:
+- Auth routes mounted at /api/auth
+- Staff routes mounted at /api/staff
+- Distributor routes mounted at /api/distributors
+- Damage claim routes mounted at /api/damage-claims
+- Mobile app routes mounted at /api/mobile
+- Swagger docs available at /api-docs
+- Sales inquiry routes mounted at /api/sales-inquiries
+Server is running on http://192.168.1.40:5050
+2025-09-08 16:06:55:655 [32minfo[39m: [32mServer running in development mode on port 5050[39m
+2025-09-08 16:06:56:656 [32minfo[39m: [32mMongoDB Connected: ac-jrg4u2a-shard-00-00.mqex9dg.mongodb.net[39m
+2025-09-08 16:06:56:656 [32minfo[39m: [32mAdmin already exists in the database[39m
+2025-09-08 16:07:13:713 [32minfo[39m: [32mREQUEST: GET /api/health from 127.0.0.1[39m
+2025-09-08 16:07:13:713 [31merror[39m: [31m404 Not Found: GET /api/health[39m
+2025-09-08 16:07:13:713 [32minfo[39m: [32mRESPONSE: GET /api/health - 404 - 3ms[39m
+2025-09-08 16:07:13:713 [31merror[39m: [31mRESPONSE ERROR: {"success":false,"error":"API route not found"}[39m
+2025-09-08 16:07:27:727 [32minfo[39m: [32mREQUEST: POST /api/mobile/marketing-activity/punch-in from 127.0.0.1[39m
+2025-09-08 16:07:27:727 [32minfo[39m: [32mREQUEST BODY: {"distributorId":"68beaae48c7436c02ba48f10","retailShop":"Jay ganesh","distributor":"Jay ganesh ji","areaName":"Delhi, Moti nagar","tripCompanion":{"category":"Marketing Staff","name":"NAman"},"modeOfTransport":"Car","selfieImage":"file:///storage/emulated/0/Android/data/com.kallakuri/files/Pictures/image-0c1cb41d-88b0-4ecc-8523-99f1f248d94c8759330303206069365.jpg","shopTypes":["Retailer"],"shops":[],"brandSupplyEstimates":[{"_id":"","name":"Test","variants":[{"_id":"","name":"pouch","sizes":[{"_id":"","name":"100Ml","openingStock":"34","proposedMarketRate":"500"}]}]}]}[39m
+2025-09-08 16:07:27:727 [32minfo[39m: [32mRESPONSE: POST /api/mobile/marketing-activity/punch-in - 201 - 202ms[39m
+2025-09-08 16:07:35:735 [32minfo[39m: [32mREQUEST: GET /api/auth/me from 127.0.0.1[39m
+2025-09-08 16:07:36:736 [32minfo[39m: [32mRESPONSE: GET /api/auth/me - 200 - 92ms[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mREQUEST: GET /api/staff?page=1&limit=100 from 127.0.0.1[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mRESPONSE: GET /api/staff?page=1&limit=100 - 200 - 132ms[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mAdmin 68bae278d77af10e427303d6 retrieved staff list[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mREQUEST: GET /api/staff?page=1&limit=100 from 127.0.0.1[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mREQUEST: GET /api/distributors from 127.0.0.1[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mRESPONSE: GET /api/distributors - 200 - 75ms[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mREQUEST: GET /api/marketing-activity?page=1&limit=10 from 127.0.0.1[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mRESPONSE: GET /api/staff?page=1&limit=100 - 200 - 111ms[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mAdmin 68bae278d77af10e427303d6 retrieved staff list[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mREQUEST: GET /api/distributors from 127.0.0.1[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mRESPONSE: GET /api/distributors - 200 - 78ms[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mRESPONSE: GET /api/marketing-activity?page=1&limit=10 - 200 - 200ms[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mREQUEST: GET /api/marketing-activity?page=1&limit=10 from 127.0.0.1[39m
+2025-09-08 16:07:38:738 [32minfo[39m: [32mRESPONSE: GET /api/marketing-activity?page=1&limit=10 - 200 - 202ms[39m
