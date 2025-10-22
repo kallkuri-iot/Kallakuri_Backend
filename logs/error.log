@@ -3642,3 +3642,5 @@
 2025-09-13 06:39:47.163 ERROR: RESPONSE ERROR: {"success":false,"error":"Invalid token. Please log in again.","code":"INVALID_TOKEN"}
 2025-09-29 06:59:32.601 ERROR: RESPONSE ERROR: Build files not found. Please run npm build first.
 2025-09-29 06:59:32.650 ERROR: RESPONSE ERROR: Build files not found. Please run npm build first.
+2025-10-22 15:32:44.379 ERROR: Uncaught Exception: listen EADDRINUSE: address already in use 0.0.0.0:5050
+2025-10-22 15:36:19.160 ERROR: RESPONSE ERROR: {"success":false,"error":"You are not logged in. Please log in to access this resource.","code":"NO_TOKEN"}
