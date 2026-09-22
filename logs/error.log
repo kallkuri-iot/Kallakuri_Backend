@@ -3644,3 +3644,4 @@
 2025-09-29 06:59:32.650 ERROR: RESPONSE ERROR: Build files not found. Please run npm build first.
 2025-10-22 15:32:44.379 ERROR: Uncaught Exception: listen EADDRINUSE: address already in use 0.0.0.0:5050
 2025-10-22 15:36:19.160 ERROR: RESPONSE ERROR: {"success":false,"error":"You are not logged in. Please log in to access this resource.","code":"NO_TOKEN"}
+2026-09-22 06:54:31.141 ERROR: Error connecting to MongoDB: querySrv ENOTFOUND _mongodb._tcp.cluster0.bssqdv6.mongodb.net
